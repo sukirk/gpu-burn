@@ -1,5 +1,7 @@
 # gpu-burn
 
+[![CI](https://github.com/sukirk/gpu-burn/actions/workflows/ci.yml/badge.svg)](https://github.com/sukirk/gpu-burn/actions/workflows/ci.yml)
+
 把 NVIDIA 显卡的显存占满、GPU 利用率刷到接近 100%，用来做压测、烤机、占卡。
 一个 43KB 的单文件二进制，只依赖 glibc。
 
