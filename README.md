@@ -39,10 +39,32 @@ $ ./gpu_burn --check
 | 编译 | gcc + make（只用来编这个程序，不涉及 CUDA） |
 | Python 版 | Python ≥ 3.6，无需 pip 包 |
 
+## 下载预编译二进制
+
+不想自己编译就从 [Releases](https://github.com/sukirk/gpu-burn/releases) 下：每个发行版一个包，内容相同，只是编译环境不同。
+
+| 文件 | 编译环境 |
+| --- | --- |
+| `gpu-burn-VERSION-linux-x86_64-ubuntu-20.04.tar.gz` | ubuntu 20.04 / gcc 9 |
+| `gpu-burn-VERSION-linux-x86_64-debian-11.tar.gz` | debian 11 / gcc 10 |
+| `gpu-burn-VERSION-linux-x86_64-ubuntu-22.04.tar.gz` | ubuntu 22.04 / gcc 11 |
+| `gpu-burn-VERSION-linux-x86_64-debian-12.tar.gz` | debian 12 / gcc 12 |
+| `gpu-burn-VERSION-linux-x86_64-ubuntu-24.04.tar.gz` | ubuntu 24.04 / gcc 13 |
+
+包里是 `gpu_burn` + `README.md` + `LICENSE` + `BUILD-INFO`（编译环境、gcc 版本、这个二进制要求的最高 glibc 符号版本）。
+拿不准就下 `ubuntu-20.04` 那个，要求最低，在更新的发行版上照样能跑。
+
+```bash
+tar xzf gpu-burn-*-linux-x86_64-ubuntu-20.04.tar.gz
+cd gpu-burn-*/
+./gpu_burn --check
+```
+
+Release 里带 `SHA256SUMS`，可用 `sha256sum -c SHA256SUMS` 校验。
+
 ## 快速开始
 
-仓库里不放编译产物。先 `make` 编出 `./gpu_burn`（见[编译](#编译)），再按下面用；
-不想编译就直接用 `python/gpu_burn.py`。
+不用下载也行：`make` 编出 `./gpu_burn`（见[编译](#编译)），或者直接用 `python/gpu_burn.py`（只依赖标准库）。
 
 ```bash
 # 二进制放进容器（挂载最省事）
@@ -146,6 +168,8 @@ docker run --rm -v "$PWD":/work -w /work ubuntu:20.04 \
     bash -c "apt-get update -qq && apt-get install -y -qq gcc libc6-dev make && make"
 ```
 
+CI 会分别在 ubuntu 20.04 / 22.04 / 24.04、debian 11 / 12 上编译并跑测试，打好的包推到 Release。
+
 ## 测试
 
 `make check` 用 `tests/` 下的假驱动（`mock_libcuda.c`、`mock_nvml.c`）替换真驱动，
@@ -167,7 +191,11 @@ docker run --rm -v "$PWD":/work -w /work ubuntu:20.04 \
 │   ├── mock_nvml.c         # 假 libnvidia-ml.so.1
 │   ├── run_tests.sh        # 端到端用例（make check）
 │   └── verify_ptx.sh       # PTX 一致性 / ptxas 校验
-└── .github/workflows/ci.yml
+└── .github/
+    ├── workflows/ci.yml            # 测试 + 五个发行版构建 + 发 Release
+    ├── scripts/package.sh          # 打包成 dist/gpu-burn-*.tar.gz
+    ├── scripts/build-in-container.sh
+    └── RELEASE_NOTES.md            # Release 正文
 ```
 
 ## 典型表现

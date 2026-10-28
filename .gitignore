@@ -7,6 +7,10 @@ tests/mock/*.so*
 tests/.out/
 tests/.mock.log
 
+# 打包产物（由 CI 传到 Release）
+dist/
+pkg/
+
 # Python
 __pycache__/
 *.py[cod]

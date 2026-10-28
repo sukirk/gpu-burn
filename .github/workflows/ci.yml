@@ -2,8 +2,14 @@ name: CI
 
 on:
   push:
+    branches: [main]
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
+
+env:
+  # tag 构建用于发 Release 时取 tag 名（v1.0.0）；平时是 dev
+  VERSION: ${{ github.ref_type == 'tag' && github.ref_name || 'dev' }}
 
 jobs:
   test:
@@ -18,16 +24,88 @@ jobs:
       - name: PTX 一致性
         run: bash tests/verify_ptx.sh
 
-  build-focal:
-    name: build on ubuntu 20.04 (glibc 2.31)
+  # 在老发行版容器里编并跑一遍测试：产物只要求 glibc 2.17，新版发行版上也能跑
+  build-distro:
+    name: build on ${{ matrix.label }}
+    needs: test
     runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: ubuntu-20.04
+            image: ubuntu:20.04
+          - label: debian-11
+            image: debian:11
+          - label: debian-12
+            image: debian:12
     steps:
       - uses: actions/checkout@v4
-      - name: 在 focal 容器里编译，确认老发行版也能编
+      - name: 编译 + 测试 + 打包
+        run: bash .github/scripts/build-in-container.sh "${{ matrix.image }}" "${{ matrix.label }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gpu-burn-${{ matrix.label }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  # 在较新的发行版上直接用自带 gcc 编一遍
+  build-host:
+    name: build on ${{ matrix.label }}
+    needs: test
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: ubuntu-22.04
+            runner: ubuntu-22.04
+          - label: ubuntu-24.04
+            runner: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: 编译 + 测试 + 打包
         run: |
-          docker run --rm -v "$PWD":/work -w /work ubuntu:20.04 bash -c '
-            apt-get update -qq
-            apt-get install -y -qq gcc libc6-dev make >/dev/null
-            make
-            ls -l gpu_burn
-          '
+          make
+          make check
+          echo "==> glibc 最高要求：$(objdump -T gpu_burn | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)"
+          bash .github/scripts/package.sh "$VERSION" "${{ matrix.label }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gpu-burn-${{ matrix.label }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  # 推 v* tag 时收齐所有产物，建 Release 供下载
+  release:
+    name: release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test, build-distro, build-host]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: 逐个校验压缩包并生成 SHA256SUMS
+        run: |
+          set -e
+          ls -l dist
+          rm -rf /tmp/unpack && mkdir -p /tmp/unpack
+          for f in dist/*.tar.gz; do
+              tar -xzf "$f" -C /tmp/unpack
+          done
+          find /tmp/unpack -name gpu_burn -type f -perm -u+x -print
+          ( cd dist && sha256sum *.tar.gz | tee SHA256SUMS )
+      - name: 创建 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+              dist/*.tar.gz dist/SHA256SUMS \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$GITHUB_REF_NAME" \
+              --notes-file .github/RELEASE_NOTES.md
