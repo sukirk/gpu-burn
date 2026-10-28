@@ -1,0 +1,12 @@
+# 编译产物
+gpu_burn
+*.o
+
+# 测试产物
+tests/mock/*.so*
+tests/.out/
+tests/.mock.log
+
+# Python
+__pycache__/
+*.py[cod]

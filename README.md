@@ -1,0 +1,203 @@
+# gpu-burn
+
+把 NVIDIA 显卡的显存占满、GPU 利用率刷到接近 100%，用来做压测、烤机、占卡。
+一个 43KB 的单文件二进制，只依赖 glibc。
+
+```
+$ ./gpu_burn --check
+[gpu_burn 09:39:50] 驱动库: libcuda.so.1
+[gpu_burn 09:39:50] 设备 #0: NVIDIA A100-SXM4-80GB  (sm_80, 108 SM)
+[gpu_burn 09:39:50] 显存: 总 80.00 GiB / 空闲 79.25 GiB
+[gpu_burn 09:39:50] 分配 + 写入 256MiB 测试显存: OK
+[gpu_burn 09:39:50] kernel: 内联 PTX JIT 成功（sm_80 / PTX ISA 7.0）
+[gpu_burn 09:39:50] 自检通过：当前环境可以正常刷
+```
+
+## 特性
+
+- **零依赖**：不需要 CUDA Toolkit、nvcc、PyTorch、Python 或任何 pip 包，只要宿主机 NVIDIA 驱动注入的 `libcuda.so.1`
+- **单个二进制**：`gpu_burn` 约 43KB，拷进容器就能跑，glibc ≥ 2.17
+- **自适应**：启动时自动标定 kernel 时长，换卡、换驱动不用改参数
+- **PTX JIT**：计算 kernel 以内联 PTX 交给驱动编译，一份程序覆盖 sm_70 及以上
+- **显存占满**：按空闲比例（`--mem-pct`）或绝对值（`--mem-gb`）分配，OOM 自动降级
+- **利用率拉满**：每线程 4 条独立 FP32 FMA 并行发射，填满每个 SM 的 4 个 warp 调度器
+- **可选带宽压测**：`--churn` 额外做 device-to-device 拷贝
+- **干净退出**：`Ctrl-C` / `SIGTERM` / `SIGHUP` 都会排干队列、释放显存再退出
+- **状态可见**：周期性打印利用率、显存、温度、功耗（容器内有 NVML 时）
+- **附带 Python 版**：`python/gpu_burn.py`，只用标准库，作为没有编译环境时的备选
+
+## 环境要求
+
+| 项 | 要求 |
+| --- | --- |
+| GPU | NVIDIA sm_70 及以上（A100 / A30 / V100 / H100 等） |
+| 驱动 | 支持 CUDA 11+ 的 NVIDIA 驱动 |
+| 系统 | Linux x86_64，glibc ≥ 2.17 |
+| 容器 | 以 `--gpus all` 启动（需要宿主机装 nvidia-container-toolkit） |
+| 编译 | gcc + make（只用来编这个程序，不涉及 CUDA） |
+| Python 版 | Python ≥ 3.6，无需 pip 包 |
+
+## 快速开始
+
+仓库里不放编译产物。先 `make` 编出 `./gpu_burn`（见[编译](#编译)），再按下面用；
+不想编译就直接用 `python/gpu_burn.py`。
+
+```bash
+# 二进制放进容器（挂载最省事）
+docker run --gpus all -it -v "$PWD":/opt/gpu-burn <你的镜像> bash
+
+/opt/gpu-burn/gpu_burn --check      # 先自检：看得到卡、能分配显存、kernel 能 JIT
+/opt/gpu-burn/gpu_burn              # 开刷：占 60% 空闲显存，一直跑，每 5 秒报一次
+```
+
+跑固定时长、跑完自动退出：
+
+```bash
+docker run --gpus all --rm -v "$PWD":/opt/gpu-burn <你的镜像> \
+    /opt/gpu-burn/gpu_burn --duration 1800
+```
+
+用 Python 版（不需要编译）：
+
+```bash
+docker run --gpus all -it -v "$PWD":/opt/gpu-burn <你的镜像> \
+    python3 /opt/gpu-burn/python/gpu_burn.py --duration 1800
+```
+
+## 用法
+
+### 常用示例
+
+```bash
+./gpu_burn                          # 占 60% 空闲显存，一直刷，每 5 秒报一次
+./gpu_burn --mem-gb 78              # 固定占 78GiB（80GB 卡上约 97%）
+./gpu_burn --mem-pct 0.9            # 占空闲显存的 90%
+./gpu_burn --duration 3600          # 刷 1 小时
+./gpu_burn --churn --stats 2        # 顺带刷显存带宽，2 秒报一次
+./gpu_burn --streams 4 --queue-depth 8   # 4 个 stream 并发，队列排深一点
+./gpu_burn --check                  # 只自检，不常驻
+./gpu_burn --device 1               # 用第二张卡
+```
+
+### 参数
+
+```
+用法: gpu_burn [选项]
+
+选项:
+  --device N          GPU 序号（默认 0）
+  --mem-gb GB         固定占用多少 GiB 显存（默认按 --mem-pct 算）
+  --mem-pct P         占空闲显存的比例，0~1（默认 0.60）
+  --duration SEC      运行多少秒后自动退出，0=一直跑（默认 0）
+  --stats SEC         多少秒打一次状态，0=不打（默认 5）
+  --target-ms MS      单个 kernel 的目标时长（默认 120）
+  --iters N           每线程迭代数，0=自动标定（默认 0）
+  --blocks-per-sm N   每个 SM 排多少个 block（默认 8）
+  --threads N         每个 block 的线程数（默认 256）
+  --streams N         并发 stream 数（默认 1）
+  --queue-depth N     每个 stream 最多预排的 kernel 数（默认 4）
+  --churn             另起线程做 D2D 拷贝，把显存带宽也刷起来
+  --churn-mb MB       churn 单次拷贝大小（默认 512）
+  --check             只做环境自检和短时试跑，然后退出
+  --quiet             只打错误
+  --version           打印版本
+  -h, --help          打印本页
+```
+
+### 输出
+
+运行期间的统计行长这样（数字随卡、随参数变化）：
+
+```
+[gpu_burn 09:41:12] 发射配置: grid=864  block=256  streams=1  iters=811710
+[gpu_burn 09:41:17] 运行   10.4s | kernel 发射 87 次 | 显存 48.00 GiB/80.00 GiB | GPU 利用率 99% | 显存带宽 41% | 71C | 398W
+```
+
+一次 `--check` 会依次验证：驱动库能否加载 → 设备可见 → 能分配并写入 256MiB 显存 →
+PTX 能被 JIT → kernel 能执行。哪一步失败会直接给出要查的东西。
+
+### 退出码与信号
+
+| 退出码 | 含义 |
+| --- | --- |
+| `0` | 正常结束 |
+| `2` | 环境不满足（加载不到驱动、看不到设备、显存不够等） |
+| `3` | CUDA 调用失败 |
+
+`Ctrl-C`、`SIGTERM`、`SIGHUP` 都会走同一套收尾：排队等 GPU 干完 → 释放所有显存 →
+销毁 stream / event / module / context。容器被停掉时不会留下占着显存的僵尸进程。
+
+## 编译
+
+```bash
+make            # 生成 ./gpu_burn
+make check      # 编译 + 跑端到端测试（不需要 GPU）
+make clean
+```
+
+编译只需要 gcc 和 make，不链接任何 CUDA 库。产物链接的是 `libc`、`libdl`、`libpthread`。
+在哪个发行版上编，就要那个发行版及以上才能跑：要兼容 ubuntu 20.04（glibc 2.31），
+就在对应容器里编：
+
+```bash
+docker run --rm -v "$PWD":/work -w /work ubuntu:20.04 \
+    bash -c "apt-get update -qq && apt-get install -y -qq gcc libc6-dev make && make"
+```
+
+## 测试
+
+`make check` 用 `tests/` 下的假驱动（`mock_libcuda.c`、`mock_nvml.c`）替换真驱动，
+跑 14 项端到端用例：自检、常驻刷、`--duration`、OOM 降级、多 stream、`--churn`、
+`SIGTERM` 优雅退出、分配/释放配平、上下文销毁，原生版和 Python 版各一遍。
+
+`tests/verify_ptx.sh` 校验两版生成的 PTX 是否逐字节一致；机器上有 `ptxas` 时
+（`PTXAS=/path/to/ptxas`）还会汇编一遍确认指令合法。
+
+## 目录结构
+
+```
+.
+├── Makefile
+├── src/gpu_burn.c          # 原生实现（单文件）
+├── python/gpu_burn.py      # Python 实现（单文件，仅标准库）
+├── tests/
+│   ├── mock_libcuda.c      # 假 libcuda.so.1，模拟 Driver API
+│   ├── mock_nvml.c         # 假 libnvidia-ml.so.1
+│   ├── run_tests.sh        # 端到端用例（make check）
+│   └── verify_ptx.sh       # PTX 一致性 / ptxas 校验
+└── .github/workflows/ci.yml
+```
+
+## 典型表现
+
+A100 80GB 单卡，`--mem-pct 0.60` 时：
+
+| 指标 | 表现 |
+| --- | --- |
+| 显存 | ≈ 48 GiB（`--mem-gb 78` 可到 ≈ 78 GiB） |
+| `nvidia-smi` 利用率 | ≈ 100% |
+| 显存带宽（`--churn`） | 20~45% |
+| 功耗 | 接近 TDP（A100 SXM ≈ 400W） |
+| 温度 | 60~80℃，取决于散热 |
+
+## 常见问题
+
+| 现象 | 处理 |
+| --- | --- |
+| `libcuda.so.1 没能加载` | 容器没以 GPU 方式启动。用 `--gpus all`；宿主机需装 nvidia-container-toolkit。旧版本 docker 可用 `--runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=all` |
+| `看不到任何 GPU 设备` | 同上。也可以在容器里看 `ls /dev/nvidia*`、`ldconfig -p \| grep libcuda`，在宿主机跑 `nvidia-smi` |
+| 可占显存太少 | 卡上已有别的进程，用 `--mem-gb` 给小一点 |
+| 统计行没有温度/功耗 | 容器里没有 `libnvidia-ml.so.1`，不影响刷 |
+| `所有 PTX 版本都不能被驱动接受` | 驱动太老（早于 CUDA 11），升级宿主机驱动 |
+| 想知道实际刷到什么程度 | 另开终端 `nvidia-smi -l 1`，或本程序 `--stats 1` |
+| 想换成更小的显存占用 | `--mem-pct 0.3` 或 `--mem-gb 16` |
+
+## 注意
+
+- 默认会占掉 60% 的空闲显存、把功耗推到接近 TDP。**共享卡上先问清楚**，用 `--mem-pct`/`--mem-gb` 调小。
+- 长时间满载烤机注意散热和电费。
+- 程序只管刷，不校验计算结果，也不做算力跑分。
+
+## License
+
+[MIT](LICENSE)

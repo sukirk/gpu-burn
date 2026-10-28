@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: build + test
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: 编译
+        run: make
+      - name: 端到端测试（假驱动，不需要 GPU）
+        run: make check
+      - name: PTX 一致性
+        run: bash tests/verify_ptx.sh
+
+  build-focal:
+    name: build on ubuntu 20.04 (glibc 2.31)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: 在 focal 容器里编译，确认老发行版也能编
+        run: |
+          docker run --rm -v "$PWD":/work -w /work ubuntu:20.04 bash -c '
+            apt-get update -qq
+            apt-get install -y -qq gcc libc6-dev make >/dev/null
+            make
+            ls -l gpu_burn
+          '
