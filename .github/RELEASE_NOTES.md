@@ -9,7 +9,7 @@
 | 文件 | 编译环境 |
 | --- | --- |
 | `gpu-burn-*-linux-x86_64-ubuntu-20.04.tar.gz` | ubuntu 20.04 / gcc 9 |
-| `gpu-burn-*-linux-x86_64-debian-11.tar.gz` | debian 11 / gcc 10 |
+| `gpu-burn-*-linux-x86_64-debian-13.tar.gz` | debian 13 / gcc 14 |
 | `gpu-burn-*-linux-x86_64-ubuntu-22.04.tar.gz` | ubuntu 22.04 / gcc 11 |
 | `gpu-burn-*-linux-x86_64-debian-12.tar.gz` | debian 12 / gcc 12 |
 | `gpu-burn-*-linux-x86_64-ubuntu-24.04.tar.gz` | ubuntu 24.04 / gcc 13 |

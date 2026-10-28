@@ -46,7 +46,7 @@ $ ./gpu_burn --check
 | 文件 | 编译环境 |
 | --- | --- |
 | `gpu-burn-VERSION-linux-x86_64-ubuntu-20.04.tar.gz` | ubuntu 20.04 / gcc 9 |
-| `gpu-burn-VERSION-linux-x86_64-debian-11.tar.gz` | debian 11 / gcc 10 |
+| `gpu-burn-VERSION-linux-x86_64-debian-13.tar.gz` | debian 13 / gcc 14 |
 | `gpu-burn-VERSION-linux-x86_64-ubuntu-22.04.tar.gz` | ubuntu 22.04 / gcc 11 |
 | `gpu-burn-VERSION-linux-x86_64-debian-12.tar.gz` | debian 12 / gcc 12 |
 | `gpu-burn-VERSION-linux-x86_64-ubuntu-24.04.tar.gz` | ubuntu 24.04 / gcc 13 |
@@ -168,7 +168,7 @@ docker run --rm -v "$PWD":/work -w /work ubuntu:20.04 \
     bash -c "apt-get update -qq && apt-get install -y -qq gcc libc6-dev make && make"
 ```
 
-CI 会分别在 ubuntu 20.04 / 22.04 / 24.04、debian 11 / 12 上编译并跑测试，打好的包推到 Release。
+CI 会分别在 ubuntu 20.04 / 22.04 / 24.04、debian 12 / 13 上编译并跑测试，打好的包推到 Release。
 
 ## 测试
 

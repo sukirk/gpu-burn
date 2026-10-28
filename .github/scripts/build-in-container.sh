@@ -5,12 +5,20 @@
 #   build-in-container.sh ubuntu:20.04 ubuntu-20.04
 #
 # 打包出来的二进制放在 dist/ 下，属主是容器里的 root，只读即可，不需要 chown。
+#
+# 本地跑时如果 docker 默认 bridge 的 DNS 不通，可以加 DOCKER_NETWORK=host。
 set -euo pipefail
 
 image=${1:?用法: build-in-container.sh <docker image> <label>}
 label=${2:?用法: build-in-container.sh <docker image> <label>}
 
+net_args=()
+if [ -n "${DOCKER_NETWORK:-}" ]; then
+    net_args=(--network "$DOCKER_NETWORK")
+fi
+
 docker run --rm \
+    "${net_args[@]}" \
     -v "$PWD":/work -w /work \
     -e VERSION="${VERSION:-dev}" \
     -e LABEL="$label" \

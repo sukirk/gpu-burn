@@ -35,8 +35,8 @@ jobs:
         include:
           - label: ubuntu-20.04
             image: ubuntu:20.04
-          - label: debian-11
-            image: debian:11
+          - label: debian-13
+            image: debian:13
           - label: debian-12
             image: debian:12
     steps:
@@ -99,6 +99,11 @@ jobs:
               tar -xzf "$f" -C /tmp/unpack
           done
           find /tmp/unpack -name gpu_burn -type f -perm -u+x -print
+          count=$(find /tmp/unpack -name gpu_burn -type f -perm -u+x | wc -l)
+          if [ "$count" -lt 5 ]; then
+              echo "产物数量不对：$count 个（应至少 5 个）" >&2
+              exit 1
+          fi
           ( cd dist && sha256sum *.tar.gz | tee SHA256SUMS )
       - name: 创建 Release
         env:
