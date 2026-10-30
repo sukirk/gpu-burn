@@ -15,6 +15,8 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <sys/prctl.h>
+#include <sys/wait.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,7 +24,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define VERSION "1.0.1"
+#define VERSION "1.1.0"
 
 /* ------------------------------------------------------------------------- */
 /* CUDA Driver API 的最小类型/常量定义（避免依赖 cuda.h）                      */
@@ -165,6 +167,7 @@ static volatile sig_atomic_t g_stop;
 static int g_quiet;
 static int g_driver_loaded;
 static int g_cleanup_quiet; /* --check 收尾时不要多打一行“已释放” */
+static int g_dev_tag = -1;  /* >=0 时日志里带上卡号：多卡模式下每个子进程一个 */
 
 static void logmsg(const char *fmt, ...)
 {
@@ -175,7 +178,10 @@ static void logmsg(const char *fmt, ...)
     struct tm tm;
     localtime_r(&t, &tm);
     strftime(ts, sizeof ts, "%H:%M:%S", &tm);
-    printf("[gpu_burn %s] ", ts);
+    if (g_dev_tag >= 0)
+        printf("[gpu_burn %s #%d] ", ts, g_dev_tag);
+    else
+        printf("[gpu_burn %s] ", ts);
     va_list ap;
     va_start(ap, fmt);
     vprintf(fmt, ap);
@@ -187,7 +193,7 @@ static void logmsg(const char *fmt, ...)
 static void errmsg(const char *fmt, ...)
 {
     fflush(stdout);
-    fprintf(stderr, "[gpu_burn] ERR: ");
+    fprintf(stderr, g_dev_tag >= 0 ? "[gpu_burn #%d] ERR: " : "[gpu_burn] ERR: ", g_dev_tag);
     va_list ap;
     va_start(ap, fmt);
     vfprintf(stderr, fmt, ap);
@@ -201,7 +207,7 @@ static void warnmsg(const char *fmt, ...)
     if (g_quiet)
         return;
     fflush(stdout);
-    fprintf(stderr, "[gpu_burn] WARN: ");
+    fprintf(stderr, g_dev_tag >= 0 ? "[gpu_burn #%d] WARN: " : "[gpu_burn] WARN: ", g_dev_tag);
     va_list ap;
     va_start(ap, fmt);
     vfprintf(stderr, fmt, ap);
@@ -393,8 +399,13 @@ typedef struct {
     size_t size;
 } Chunk;
 
+#define MAX_DEVICES 32
+
 typedef struct {
     int device;
+    int devs[MAX_DEVICES];   /* 要刷的卡号列表（--devices 展开之后） */
+    int ndevs;
+    const char *devices_spec; /* --devices 的原始字符串，NULL 表示没给 */
     double mem_gb;      /* <0 表示用 mem_pct */
     double mem_pct;
     double duration;
@@ -1247,6 +1258,142 @@ static void on_signal(int sig)
     g_stop = 1;
 }
 
+/* --device / --devices 解析成具体卡号。返回 0 成功，-1 失败（已打错误） */
+static int resolve_devices(Args *a, int count)
+{
+    a->ndevs = 1;
+    a->devs[0] = a->device;
+    if (!a->devices_spec)
+        return 0;
+
+    if (strcmp(a->devices_spec, "all") == 0) {
+        int n = count < MAX_DEVICES ? count : MAX_DEVICES;
+        a->ndevs = n;
+        for (int i = 0; i < n; i++)
+            a->devs[i] = i;
+        return 0;
+    }
+
+    a->ndevs = 0;
+    const char *p = a->devices_spec;
+    while (*p) {
+        char *end = NULL;
+        long v = strtol(p, &end, 10);
+        if (end == p) {
+            errmsg("--devices 解析不了: \"%s\"（写 0,1,2 或 all）", a->devices_spec);
+            return -1;
+        }
+        if (v < 0 || v >= count) {
+            errmsg("--devices 里的 %ld 超出范围（本机共 %d 张卡）", v, count);
+            return -1;
+        }
+        int dup = 0;
+        for (int i = 0; i < a->ndevs; i++)
+            if (a->devs[i] == (int)v)
+                dup = 1;
+        if (!dup && a->ndevs < MAX_DEVICES)
+            a->devs[a->ndevs++] = (int)v;
+        p = end;
+        while (*p == ',' || *p == ' ')
+            p++;
+    }
+    if (a->ndevs == 0) {
+        errmsg("--devices 没给任何卡号");
+        return -1;
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------------- */
+/* 多卡：每张卡 fork 一个子进程                                               */
+/*                                                                            */
+/* 一个进程里多个 CUDA 上下文要来回切 current context，容易出错，而且一张卡挂   */
+/* 了会连坐。所以每张卡一个子进程：各自建上下文、各自刷、各自释放。            */
+/* 父进程只负责转发信号和回收子进程，自己不碰 CUDA 上下文，所以它被杀也不会     */
+/* 留下占着显存的孤儿（子进程都设了 PR_SET_PDEATHSIG）。                       */
+/* ------------------------------------------------------------------------- */
+
+static pid_t g_kids[MAX_DEVICES];
+static int g_nkids;
+
+static void on_forward(int sig)
+{
+    for (int i = 0; i < g_nkids; i++)
+        if (g_kids[i] > 0)
+            kill(g_kids[i], sig);
+    g_stop = 1;
+}
+
+static int run_multi(Args *a)
+{
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_forward;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGHUP, &sa, NULL);
+
+    logmsg("多卡模式: 目标卡 %d 张，每张卡一个子进程", a->ndevs);
+    for (int i = 0; i < a->ndevs; i++) {
+        int dev = a->devs[i];
+        fflush(NULL);
+        pid_t pid = fork();
+        if (pid < 0) {
+            errmsg("fork 失败: %s", strerror(errno));
+            break;
+        }
+        if (pid == 0) {
+            /* 父进程不管怎么没的（包括 kill -9），子进程都收到 SIGTERM 走正常释放流程 */
+            prctl(PR_SET_PDEATHSIG, SIGTERM);
+            if (getppid() == 1) /* fork 到 prctl 之间父进程已经没了 */
+                _exit(0);
+            /* 子进程不转发、只管自己 */
+            g_nkids = 0;
+            struct sigaction cs;
+            memset(&cs, 0, sizeof cs);
+            cs.sa_handler = on_signal;
+            sigaction(SIGINT, &cs, NULL);
+            sigaction(SIGTERM, &cs, NULL);
+            sigaction(SIGHUP, &cs, NULL);
+
+            g_dev_tag = dev;
+            a->device = dev;
+            if (a->diag) {
+                diag(a);
+                _exit(0);
+            }
+            if (a->check) {
+                self_check(a);
+                _exit(0);
+            }
+            setup(a);
+            run_loop(a);
+            cleanup_all();
+            fflush(NULL);
+            _exit(0);
+        }
+        g_kids[g_nkids++] = pid;
+    }
+
+    int worst = 0;
+    int left = g_nkids;
+    while (left > 0) {
+        int st = 0;
+        pid_t p = waitpid(-1, &st, 0);
+        if (p < 0) {
+            if (errno == EINTR)
+                continue;
+            break;
+        }
+        left--;
+        int code = WIFEXITED(st) ? WEXITSTATUS(st) : 3;
+        if (code > worst)
+            worst = code;
+    }
+    logmsg("全部 %d 个子进程已退出（显存都已释放）", g_nkids);
+    return worst;
+}
+
 static void usage(FILE *out)
 {
     fprintf(out,
@@ -1255,7 +1402,8 @@ static void usage(FILE *out)
             "占满 CUDA 显存并把 GPU 利用率刷到接近 100%%（不依赖 PyTorch / CUDA Toolkit）\n"
             "\n"
             "选项:\n"
-            "  --device N          GPU 序号（默认 0）\n"
+            "  --device N          GPU 序号（默认 0），等价于 --devices N\n"
+            "  --devices LIST      要刷的卡号，逗号分隔或 all（如 0,1,2 / all）\n"
             "  --mem-gb GB         固定占用多少 GiB 显存（默认按 --mem-pct 算）\n"
             "  --mem-pct P         占空闲显存的比例，0~1（默认 0.60）\n"
             "  --duration SEC      运行多少秒后自动退出，0=一直跑（默认 0）\n"
@@ -1279,6 +1427,8 @@ static void usage(FILE *out)
             "  gpu_burn --mem-gb 70             # 固定占 70GiB\n"
             "  gpu_burn --duration 1800         # 刷 30 分钟\n"
             "  gpu_burn --churn --stats 2       # 顺带刷显存带宽\n"
+            "  gpu_burn --devices all           # 每张卡一个子进程，全部刷起来\n"
+            "  gpu_burn --devices 0,2           # 只刷 0 号和 2 号卡\n"
             "  gpu_burn --check                 # 只自检，不常驻\n");
 }
 
@@ -1303,6 +1453,7 @@ int main(int argc, char **argv)
 
     static const struct option opt[] = {
         {"device", required_argument, 0, 'd'},
+        {"devices", required_argument, 0, 'E'},
         {"mem-gb", required_argument, 0, 'g'},
         {"mem-pct", required_argument, 0, 'p'},
         {"duration", required_argument, 0, 'D'},
@@ -1328,6 +1479,7 @@ int main(int argc, char **argv)
     while ((c = getopt_long(argc, argv, "h", opt, NULL)) != -1) {
         switch (c) {
         case 'd': a.device = atoi(optarg); break;
+        case 'E': a.devices_spec = optarg; break;
         case 'g': a.mem_gb = atof(optarg); break;
         case 'p': a.mem_pct = atof(optarg); break;
         case 'D': a.duration = atof(optarg); break;
@@ -1383,6 +1535,20 @@ int main(int argc, char **argv)
     logmsg("gpu_burn %s，pid %d", VERSION, (int)getpid());
     if (!load_driver())
         return 2;
+
+    /* 先把卡数问出来，"--devices all" 要据此展开 */
+    int devcount = 0;
+    if (g_cu.cuInit(0) == CUDA_SUCCESS)
+        g_cu.cuDeviceGetCount(&devcount);
+    if (devcount <= 0) {
+        errmsg("看不到任何 GPU 设备（cuDeviceGetCount=%d）", devcount);
+        return 3;
+    }
+    if (resolve_devices(&a, devcount) != 0)
+        return 3;
+    if (a.ndevs > 1)
+        return run_multi(&a);
+    a.device = a.devs[0];
 
     if (a.diag) {
         diag(&a);

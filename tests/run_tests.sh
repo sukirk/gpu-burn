@@ -145,6 +145,93 @@ if [ -n "$BIN" ] && [ -x "$BIN" ]; then
         && ok "原生版 SIGTERM 优雅退出" || bad "原生版 SIGTERM（退出码 $code）"
 fi
 
+# --- 多卡：--devices / --devices all / 信号收尾不留孤儿 -------------------
+# multi_suite <标签> <可执行命令...>；进程名用于查残留（python 版查命令行）
+multi_suite() {
+    local label="$1"
+    shift
+    local -a cmd=("$@")
+    local pattern
+    case "$label" in
+        python*) pattern="gpu_burn.py --devices" ;;
+        *)       pattern="^$ROOT/gpu_burn --devices" ;;
+    esac
+
+    out="$TMP/${label}_multi.txt"
+    LD_LIBRARY_PATH="$MOCK" MOCK_DEVS=2 MOCK_LOG="$LOG" \
+        "${cmd[@]}" --devices 0,1 --duration 2 --stats 1 --target-ms 40 >"$out" 2>&1
+    code=$?
+    if [ "$code" -eq 0 ] && grep -q "#0" "$out" && grep -q "#1" "$out" \
+        && grep -q "全部 2 个子进程已退出" "$out"; then
+        ok "$label --devices 0,1 两张卡各刷各的"
+    else
+        bad "$label --devices 0,1（退出码 $code）"
+        tail -10 "$out"
+    fi
+
+    out="$TMP/${label}_all.txt"
+    LD_LIBRARY_PATH="$MOCK" MOCK_DEVS=3 MOCK_LOG="$LOG" \
+        "${cmd[@]}" --devices all --duration 1 --stats 0 --target-ms 40 >"$out" 2>&1
+    code=$?
+    if [ "$code" -eq 0 ] && grep -q "全部 3 个子进程已退出" "$out"; then
+        ok "$label --devices all 展开成 3 张卡"
+    else
+        bad "$label --devices all（退出码 $code）"
+        tail -10 "$out"
+    fi
+
+    out="$TMP/${label}_bad.txt"
+    LD_LIBRARY_PATH="$MOCK" MOCK_DEVS=2 "${cmd[@]}" --devices 0,5 >"$out" 2>&1
+    code=$?
+    if [ "$code" -eq 3 ] && grep -qE "超出范围" "$out"; then
+        ok "$label --devices 越界卡号报错并退出 3"
+    else
+        bad "$label --devices 越界卡号（退出码 $code）"
+        tail -5 "$out"
+    fi
+
+    # SIGTERM：父进程收到后转给所有子进程，每个都走正常释放流程
+    out="$TMP/${label}_multisig.txt"
+    LD_LIBRARY_PATH="$MOCK" MOCK_DEVS=2 "${cmd[@]}" --devices all --stats 0 --target-ms 40 >"$out" 2>&1 &
+    pid=$!
+    sleep 2
+    kill -TERM "$pid" 2>/dev/null
+    wait "$pid"
+    code=$?
+    sleep 1
+    if [ "$code" -eq 0 ] && [ "$(grep -c "已释放显存与 CUDA 上下文" "$out")" -ge 2 ] \
+        && ! pgrep -f "$pattern" >/dev/null 2>&1; then
+        ok "$label SIGTERM 后两张卡都已释放、无残留进程"
+    else
+        bad "$label SIGTERM 多卡收尾（退出码 $code）"
+        tail -8 "$out"
+    fi
+
+    # SIGKILL 父进程：靠 PR_SET_PDEATHSIG 让子进程自己收工，不能留下占显存的孤儿
+    out="$TMP/${label}_multikill.txt"
+    LD_LIBRARY_PATH="$MOCK" MOCK_DEVS=2 "${cmd[@]}" --devices all --stats 0 --target-ms 40 >"$out" 2>&1 &
+    pid=$!
+    sleep 2
+    kill -KILL "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        pgrep -f "$pattern" >/dev/null 2>&1 || break
+        sleep 1
+    done
+    released=$(grep -c "已释放显存与 CUDA 上下文" "$out")
+    if [ "$released" -ge 2 ] && ! pgrep -f "$pattern" >/dev/null 2>&1; then
+        ok "$label 父进程被 kill -9 后子进程仍自行释放（无孤儿）"
+    else
+        bad "$label 父进程 kill -9 后的收尾（释放 $released 个）"
+        tail -8 "$out"
+    fi
+}
+
+multi_suite "python" "$PY" "$PYBIN"
+if [ -n "$BIN" ] && [ -x "$BIN" ]; then
+    multi_suite "native" "$ROOT/gpu_burn"
+fi
+
 echo
 echo "通过 $pass 项，失败 $fail 项"
 if [ "$fail" -ne 0 ]; then

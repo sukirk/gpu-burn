@@ -52,6 +52,7 @@ static int g_inited;
 static size_t g_total = 80ull << 30;
 static size_t g_used;
 static int g_sms = 108;
+static int g_devs = 1;               /* MOCK_DEVS：假装机器上有几张卡 */
 static const char *g_name = "Mock A100-SXM4-80GB";
 static double g_speed = 1.5e12;      /* 线程-迭代数/秒，逼近 A100 FP32 峰值 */
 static size_t g_oom_after = 0;       /* 非 0：used 超过它之后一律 OOM */
@@ -121,6 +122,11 @@ static void env_init(void)
     const char *s;
     if ((s = getenv("MOCK_TOTAL_GB")))
         g_total = (size_t)(atof(s) * (double)(1ull << 30));
+    if ((s = getenv("MOCK_DEVS"))) {
+        g_devs = atoi(s);
+        if (g_devs < 1)
+            g_devs = 1;
+    }
     if ((s = getenv("MOCK_SMS")))
         g_sms = atoi(s);
     if ((s = getenv("MOCK_NAME")))
@@ -137,7 +143,7 @@ static void env_init(void)
         g_fail_code = atoi(s);
     if ((s = getenv("MOCK_LOG")))
         g_log = fopen(s, "a");
-    vlog("mock: init total=%zu sms=%d name=%s", g_total, g_sms, g_name);
+    vlog("mock: init total=%zu sms=%d devs=%d name=%s", g_total, g_sms, g_devs, g_name);
 }
 
 static alloc_t *find_alloc(CUdeviceptr ptr, size_t size)
@@ -198,7 +204,7 @@ CUresult cuDeviceGetCount(int *n)
 {
     if (!n)
         return E_INVALID_VALUE;
-    *n = 1;
+    *n = g_devs;
     return OK;
 }
 
@@ -206,18 +212,22 @@ CUresult cuDeviceGet(CUdevice *d, int ordinal)
 {
     if (!d)
         return E_INVALID_VALUE;
-    if (ordinal != 0)
+    if (ordinal < 0 || ordinal >= g_devs)
         return E_INVALID_VALUE;
-    *d = 0;
+    *d = ordinal;
     return OK;
 }
 
 CUresult cuDeviceGetName(char *name, int len, CUdevice dev)
 {
-    (void)dev;
     if (!name || len <= 0)
         return E_INVALID_VALUE;
-    snprintf(name, (size_t)len, "%s", g_name);
+    if (dev < 0 || dev >= g_devs)
+        return E_INVALID_VALUE;
+    if (g_devs > 1)
+        snprintf(name, (size_t)len, "%s #%d", g_name, (int)dev);
+    else
+        snprintf(name, (size_t)len, "%s", g_name);
     return OK;
 }
 

@@ -24,6 +24,7 @@ $ ./gpu_burn --check
 - **显存占满**：按空闲比例（`--mem-pct`）或绝对值（`--mem-gb`）分配，OOM 自动降级
 - **利用率拉满**：每线程 4 条独立 FP32 FMA 并行发射，填满每个 SM 的 4 个 warp 调度器
 - **可选带宽压测**：`--churn` 额外做 device-to-device 拷贝
+- **多卡**：`--devices all` 或 `--devices 0,2`，每张卡一个子进程，一起刷一起收尾
 - **干净退出**：`Ctrl-C` / `SIGTERM` / `SIGHUP` 都会排干队列、释放显存再退出
 - **状态可见**：周期性打印利用率、显存、温度、功耗（容器内有 NVML 时）
 - **附带 Python 版**：`python/gpu_burn.py`，只用标准库，作为没有编译环境时的备选
@@ -102,6 +103,8 @@ docker run --gpus all -it -v "$PWD":/opt/gpu-burn <你的镜像> \
 ./gpu_burn --check                  # 只自检，不常驻
 ./gpu_burn --diag                   # 逐步检查驱动 → 显存 → JIT → kernel，排障用
 ./gpu_burn --device 1               # 用第二张卡
+./gpu_burn --devices all            # 机器上所有卡一起刷，每张一个子进程
+./gpu_burn --devices 0,2            # 只刷 0 号和 2 号卡
 ```
 
 ### 参数
@@ -110,7 +113,8 @@ docker run --gpus all -it -v "$PWD":/opt/gpu-burn <你的镜像> \
 用法: gpu_burn [选项]
 
 选项:
-  --device N          GPU 序号（默认 0）
+  --device N          GPU 序号（默认 0），等价于 --devices N
+  --devices LIST      要刷的卡号，逗号分隔或 all（如 0,1,2 / all）
   --mem-gb GB         固定占用多少 GiB 显存（默认按 --mem-pct 算）
   --mem-pct P         占空闲显存的比例，0~1（默认 0.60）
   --duration SEC      运行多少秒后自动退出，0=一直跑（默认 0）
@@ -129,6 +133,33 @@ docker run --gpus all -it -v "$PWD":/opt/gpu-burn <你的镜像> \
   --version           打印版本
   -h, --help          打印本页
 ```
+
+### 多卡
+
+`--devices` 接受 `all` 或逗号分隔的卡号，默认跟 `--device` 一样只刷 0 号卡。
+
+```bash
+./gpu_burn --devices all                    # 所有卡
+./gpu_burn --devices 0,1 --mem-pct 0.8      # 指定两张卡，各占各自空闲显存的 80%
+./gpu_burn --devices all --check            # 每张卡都自检一遍
+```
+
+每张卡是一个独立的子进程：各自的 CUDA 上下文、各自的显存、各自的统计行，
+日志前缀带上卡号（`[gpu_burn 12:00:00 #1]`）。好处是一张卡出问题不会连坐，
+也不需要在一个进程里来回切 current context。`--mem-pct` / `--mem-gb` 是**按每张卡**
+分别算的，不是总量。
+
+收尾上做了两层保证，所以不会出现"父进程没了、子进程还在卡上占着显存"：
+
+- 父进程收到 `Ctrl-C` / `SIGTERM` / `SIGHUP` 时转给所有子进程，各自排干队列、释放显存再退出；
+- 子进程启动时设了 `PR_SET_PDEATHSIG`，父进程就算被 `kill -9`，子进程也会收到 `SIGTERM`
+  走同一套释放流程，不会变成孤儿。
+
+父进程只负责 fork、转发信号、回收子进程，自己不建 CUDA 上下文，所以它退出时不会留下
+占着显存的句柄。退出码取所有子进程里最严重的那个（`3` > `2` > `0`）。
+
+如果只想让程序看见部分卡（比如别的任务在用 0 号卡），外面套 `CUDA_VISIBLE_DEVICES=1,2`
+更省事，此时程序内部看到的编号会重新从 0 开始。
 
 ### 输出
 
@@ -156,7 +187,9 @@ JIT、小规模 launch、满规模 launch……），每一步单独打印 OK/�
 | `3` | CUDA 调用失败 |
 
 `Ctrl-C`、`SIGTERM`、`SIGHUP` 都会走同一套收尾：排队等 GPU 干完 → 释放所有显存 →
-销毁 stream / event / module / context。容器被停掉时不会留下占着显存的僵尸进程。
+销毁 stream / module / context。多卡模式下父进程把这些信号转给每个子进程，每个子进程
+各自收尾；父进程被 `kill -9` 时子进程靠 `PR_SET_PDEATHSIG` 自行收尾。容器被停掉时
+不会留下占着显存的僵尸进程。
 
 ## 编译
 
@@ -180,8 +213,10 @@ CI 会分别在 ubuntu 20.04 / 22.04 / 24.04、debian 12 / 13 上编译并跑测
 ## 测试
 
 `make check` 用 `tests/` 下的假驱动（`mock_libcuda.c`、`mock_nvml.c`）替换真驱动，
-跑 14 项端到端用例：自检、常驻刷、`--duration`、OOM 降级、多 stream、`--churn`、
-`SIGTERM` 优雅退出、分配/释放配平、上下文销毁，原生版和 Python 版各一遍。
+跑 28 项端到端用例：自检、`--diag`、常驻刷、`--duration`、OOM 降级、多 stream、`--churn`、
+`SIGTERM` 优雅退出、显存被别的进程占着、设备侧错误带码退出、分配/释放配平、上下文销毁，
+以及多卡相关的 `--devices 0,1` / `--devices all` / 越界卡号 / `SIGTERM` 与 `kill -9`
+之后无残留进程。原生版和 Python 版各跑一遍。
 
 `tests/verify_ptx.sh` 校验两版生成的 PTX 是否逐字节一致；机器上有 `ptxas` 时
 （`PTXAS=/path/to/ptxas`）还会汇编一遍确认指令合法。

@@ -25,7 +25,8 @@ import time
 from ctypes import (POINTER, Structure, byref, c_char_p, c_float, c_int,
                     c_size_t, c_uint, c_uint32, c_uint64, c_void_p)
 
-VERSION = "1.0.1"
+VERSION = "1.1.0"
+MAX_DEVICES = 32  # --devices all 最多展开这么多张，防手滑
 
 CUDA_SUCCESS = 0
 CUDA_ERROR_OUT_OF_MEMORY = 2
@@ -827,8 +828,12 @@ def build_parser():
   python3 gpu_burn.py --duration 1800          # 刷 30 分钟
   python3 gpu_burn.py --churn --stats 2        # 顺带刷显存带宽
   python3 gpu_burn.py --check                  # 只自检，不常驻
+  python3 gpu_burn.py --devices all            # 每张卡一个子进程，全部刷起来
+  python3 gpu_burn.py --devices 0,2            # 只刷 0 号和 2 号卡
 """)
-    p.add_argument("--device", type=int, default=0, help="GPU 序号（默认 0）")
+    p.add_argument("--device", type=int, default=0, help="GPU 序号（默认 0），等价于 --devices N")
+    p.add_argument("--devices", default=None, metavar="LIST",
+                   help="要刷的卡号，逗号分隔或 all（如 0,1,2 / all），默认是 --device 给的那张")
     p.add_argument("--mem-gb", type=float, default=None, metavar="GB",
                    help="固定占用多少 GiB 显存（默认按 --mem-pct 算）")
     p.add_argument("--mem-pct", type=float, default=0.60, metavar="P",
@@ -858,20 +863,48 @@ def build_parser():
     return p
 
 
-def main(argv=None):
-    args = build_parser().parse_args(argv)
-    if args.dump_ptx:
-        sys.stdout.write(KERNEL_VARIANTS[0][1])
-        return 0
+def _make_log(quiet, tag=-1):
+    """带可选卡号前缀的日志函数；多卡模式下每个子进程一个 tag。"""
     lock = threading.Lock()
 
     def log(msg):
-        if args.quiet and not msg.startswith(("ERR", "WARN")):
+        if quiet and not msg.startswith(("ERR", "WARN")):
             return
+        ts = time.strftime("%H:%M:%S")
+        prefix = "[gpu_burn %s #%d] " % (ts, tag) if tag >= 0 else "[gpu_burn %s] " % ts
         with lock:
-            sys.stdout.write("[gpu_burn %s] %s\n" % (time.strftime("%H:%M:%S"), msg))
+            sys.stdout.write(prefix + msg + "\n")
             sys.stdout.flush()
 
+    return log
+
+
+def resolve_devices(spec, count):
+    """把 --devices 的写法解析成卡号列表。"""
+    if spec is None:
+        return None
+    if spec == "all":
+        return list(range(min(count, MAX_DEVICES)))
+    out = []
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            v = int(part)
+        except ValueError:
+            raise GpuBurnError('--devices 解析不了: "%s"（写 0,1,2 或 all）' % spec)
+        if v < 0 or v >= count:
+            raise GpuBurnError("--devices 里的 %d 超出范围（本机共 %d 张卡）" % (v, count))
+        if v not in out:
+            out.append(v)
+    if not out:
+        raise GpuBurnError("--devices 没给任何卡号")
+    return out
+
+
+def _run_one(args, log):
+    """单卡流程：建上下文、刷、收尾。多卡模式下每个子进程跑一份。"""
     burner = Burner(args, log)
     old_handlers = {}
 
@@ -902,8 +935,6 @@ def main(argv=None):
             return 0
         burner.setup()
         burner.nvml = Nvml(args.device, log)
-        if args.check:
-            pass
         burner.run()
     except GpuBurnError as exc:
         log("ERR: %s" % exc)
@@ -918,6 +949,98 @@ def main(argv=None):
             log("WARN: 清理时异常: %s" % exc)
         restore_signals()
     return code
+
+
+def _set_parent_death_signal():
+    """父进程不管怎么没的（包括 kill -9），本进程都收到 SIGTERM，不会变成占显存的孤儿。"""
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.prctl(1, signal.SIGTERM, 0, 0, 0)  # PR_SET_PDEATHSIG = 1
+    except Exception:  # 非 Linux 或没有 prctl：至少下面那句还能兜住
+        pass
+    if os.getppid() == 1:  # fork 到 prctl 之间父进程已经没了
+        sys.stdout.flush()
+        os._exit(0)
+
+
+def _run_multi(args, devices, log):
+    """多卡：每张卡一个子进程。父进程只转发信号、回收子进程，自己不碰 CUDA 上下文。"""
+    kids = []
+
+    def forward(sig, _frame):
+        for pid in kids:
+            try:
+                os.kill(pid, sig)
+            except OSError:
+                pass
+
+    saved = {}
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        saved[sig] = signal.getsignal(sig)
+        signal.signal(sig, forward)
+
+    log("多卡模式: 目标卡 %d 张，每张卡一个子进程" % len(devices))
+    for dev in devices:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        pid = os.fork()
+        if pid == 0:
+            _set_parent_death_signal()
+            child_args = argparse.Namespace(**vars(args))
+            child_args.device = dev
+            code = 3
+            try:
+                code = _run_one(child_args, _make_log(args.quiet, dev))
+            except BaseException:
+                code = 3
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(code)
+        kids.append(pid)
+
+    worst = 0
+    while kids:
+        try:
+            pid, status = os.waitpid(-1, 0)
+        except ChildProcessError:
+            break
+        if pid in kids:
+            kids.remove(pid)
+        code = os.WEXITSTATUS(status) if os.WIFEXITED(status) else 3
+        if code > worst:
+            worst = code
+
+    for sig, handler in saved.items():
+        signal.signal(sig, handler)
+    log("全部 %d 个子进程已退出（显存都已释放）" % len(devices))
+    return worst
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    if args.dump_ptx:
+        sys.stdout.write(KERNEL_VARIANTS[0][1])
+        return 0
+    log = _make_log(args.quiet)
+
+    devices = [args.device]
+    if args.devices is not None:
+        # 先把卡数问出来，"all" 要据此展开；这里只加载驱动，不建上下文
+        try:
+            count = Cuda(log).init()
+        except GpuBurnError as exc:  # 驱动装不上属于环境问题，退出码 2
+            log("ERR: %s" % exc)
+            return 2
+        try:
+            devices = resolve_devices(args.devices, count)
+        except GpuBurnError as exc:  # 参数写错，退出码 3，和原生版一致
+            log("ERR: %s" % exc)
+            return 3
+
+    if len(devices) > 1:
+        return _run_multi(args, devices, log)
+    args.device = devices[0]
+    return _run_one(args, log)
 
 
 def _diag(args, log):

@@ -7,6 +7,7 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 typedef struct {
@@ -21,11 +22,14 @@ typedef struct {
 } nvmlMemory_t;
 
 static int g_inited;
-static int g_device;
+static unsigned g_device;
 
 int nvmlInit_v2(void)
 {
-    g_inited = 1;
+    const char *s = getenv("MOCK_DEVS");
+    g_inited = s ? atoi(s) : 8; /* 这台"机器"上有几张卡，和假驱动保持一致 */
+    if (g_inited < 1)
+        g_inited = 1;
     return 0;
 }
 
@@ -37,8 +41,13 @@ int nvmlShutdown(void)
 
 int nvmlDeviceGetHandleByIndex_v2(unsigned int index, void **dev)
 {
-    if (!dev || index != 0)
+    if (!dev)
         return 3; /* NVML_ERROR_INVALID_ARGUMENT */
+    if (!g_inited)
+        return 1; /* NVML_ERROR_UNINITIALIZED */
+    if (index >= (unsigned)g_inited)
+        return 3;
+    g_device = index;
     *dev = &g_device;
     return 0;
 }
