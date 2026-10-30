@@ -62,6 +62,11 @@ out="$TMP/check.txt"
 LD_LIBRARY_PATH="$MOCK" MOCK_LOG="$LOG" "$PY" "$PYBIN" --check >"$out" 2>&1
 expect "--check 全流程自检" $? "$out" "自检通过"
 
+# 2b) --diag 逐步检查链路
+out="$TMP/diag.txt"
+LD_LIBRARY_PATH="$MOCK" "$PY" "$PYBIN" --diag >"$out" 2>&1
+expect "--diag 逐步检查链路" $? "$out" "diag 完成"
+
 # 3) 正常刷 + 每 1 秒统计
 out="$TMP/run.txt"
 LD_LIBRARY_PATH="$MOCK" MOCK_LOG="$LOG" "$PY" "$PYBIN" --duration 2 --stats 1 --target-ms 40 >"$out" 2>&1
@@ -89,7 +94,20 @@ code=$?
 [ "$code" -eq 0 ] && grep -qE "已释放显存" "$out" \
     && ok "SIGTERM 优雅退出并释放显存" || { bad "SIGTERM 退出（退出码 $code）"; tail -5 "$out"; }
 
-# 7) mock 侧断言：那次完整运行里所有参数合法性检查都过了，且分配/释放配平
+# 7) 设备侧错误（上下文丢失）：报错必须带错误码，退出 3
+out="$TMP/sticky.txt"
+LD_LIBRARY_PATH="$MOCK" MOCK_FAIL_LAUNCH_AT=1 MOCK_FAIL_CODE=999 "$PY" "$PYBIN" --stats 0 >"$out" 2>&1
+code=$?
+[ "$code" -eq 3 ] && grep -qE "rc=999" "$out" \
+    && ok "设备侧错误时带错误码退出 3" || { bad "设备侧错误路径（退出码 $code）"; tail -8 "$out"; }
+
+# 8) 显存被别的进程占着（总 39GiB / 空闲 2.6GiB）也要能正常刷
+out="$TMP/tight.txt"
+LD_LIBRARY_PATH="$MOCK" MOCK_TOTAL_GB=39 MOCK_USED_GB=36.4 \
+    "$PY" "$PYBIN" --duration 1 --stats 0 >"$out" 2>&1
+expect "显存被别的程序占着时也能正常刷" $? "$out" "已释放显存与 CUDA 上下文"
+
+# 9) mock 侧断言：那次完整运行里所有参数合法性检查都过了，且分配/释放配平
 if grep -qE "BAD SETUP|OUT OF RANGE|INVALID_PTX" "$LOG"; then
     bad "mock 侧参数校验（发现非法调用）"
 else
@@ -110,6 +128,9 @@ if [ -n "$BIN" ] && [ -x "$BIN" ]; then
     out="$TMP/bin_check.txt"
     LD_LIBRARY_PATH="$MOCK" "$BIN" --check >"$out" 2>&1
     expect "原生版 --check" $? "$out" "自检通过"
+    out="$TMP/bin_diag.txt"
+    LD_LIBRARY_PATH="$MOCK" "$BIN" --diag >"$out" 2>&1
+    expect "原生版 --diag" $? "$out" "diag 完成"
     out="$TMP/bin_run.txt"
     LD_LIBRARY_PATH="$MOCK" "$BIN" --duration 2 --stats 1 --target-ms 40 >"$out" 2>&1
     expect "原生版常驻刷" $? "$out" "已释放显存与 CUDA 上下文"

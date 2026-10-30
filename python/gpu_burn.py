@@ -25,7 +25,7 @@ import time
 from ctypes import (POINTER, Structure, byref, c_char_p, c_float, c_int,
                     c_size_t, c_uint, c_uint32, c_uint64, c_void_p)
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 
 CUDA_SUCCESS = 0
 CUDA_ERROR_OUT_OF_MEMORY = 2
@@ -248,13 +248,14 @@ class Cuda(object):
 
     # -- 基础调用 ---------------------------------------------------------- #
     def error_str(self, rc):
+        """错误码带上数字：驱动对某些码只回 "unknown"，没有数字就无从查起。"""
         try:
             buf = c_char_p()
             if self.lib.cuGetErrorString(rc, byref(buf)) == CUDA_SUCCESS and buf.value:
-                return buf.value.decode("utf-8", "replace")
+                return "%s (rc=%d)" % (buf.value.decode("utf-8", "replace"), rc)
         except Exception:
             pass
-        return "CUDA error %d" % rc
+        return "unknown (rc=%d)" % rc
 
     def check(self, rc, what):
         if rc != CUDA_SUCCESS:
@@ -346,7 +347,7 @@ class Cuda(object):
         self.check(self.lib.cuMemcpyDtoDAsync_v2(c_uint64(dst), c_uint64(src), c_size_t(nbytes), stream),
                    "cuMemcpyDtoDAsync")
 
-    # -- stream / event ---------------------------------------------------- #
+    # -- stream ------------------------------------------------------------ #
     def stream_create(self):
         s = c_void_p()
         self.check(self.lib.cuStreamCreate(byref(s), 0), "cuStreamCreate")
@@ -359,27 +360,6 @@ class Cuda(object):
         rc = self.lib.cuStreamDestroy_v2(stream)
         if rc != CUDA_SUCCESS:
             self.log("WARN: cuStreamDestroy -> %s" % self.error_str(rc))
-
-    def event_create(self):
-        e = c_void_p()
-        self.check(self.lib.cuEventCreate(byref(e), CU_EVENT_DEFAULT), "cuEventCreate")
-        return e
-
-    def event_record(self, event, stream):
-        self.check(self.lib.cuEventRecord(event, stream), "cuEventRecord")
-
-    def event_sync(self, event):
-        self.check(self.lib.cuEventSynchronize(event), "cuEventSynchronize")
-
-    def event_elapsed_ms(self, start, end):
-        ms = c_float()
-        self.check(self.lib.cuEventElapsedTime(byref(ms), start, end), "cuEventElapsedTime")
-        return float(ms.value)
-
-    def event_destroy(self, event):
-        rc = self.lib.cuEventDestroy_v2(event)
-        if rc != CUDA_SUCCESS:
-            self.log("WARN: cuEventDestroy -> %s" % self.error_str(rc))
 
     # -- module / kernel --------------------------------------------------- #
     def load_kernel(self, out_ptr):
@@ -554,19 +534,17 @@ def touch_vram(cu, chunks, stream, log):
 # --------------------------------------------------------------------------- #
 
 def calibrate(cu, fn, grid, block, stream, out_ptr, target_ms, log):
-    """试跑几次，把每线程迭代数标定到目标时长（换卡不用改参数）。"""
-    probe = 200000
+    """试跑几次，把每线程迭代数标定到目标时长（换卡不用改参数）。
+
+    计时只用 host 时钟 + stream 同步，不碰 event API：某些共享/虚拟化环境里
+    event 计时会直接失败，而 stream 同步本来就绕不开。
+    """
+    probe = 20000
     for _ in range(4):
-        ev0, ev1 = cu.event_create(), cu.event_create()
-        try:
-            cu.event_record(ev0, stream)
-            cu.launch(fn, grid, block, stream, out_ptr, probe)
-            cu.event_record(ev1, stream)
-            cu.event_sync(ev1)
-            ms = cu.event_elapsed_ms(ev0, ev1)
-        finally:
-            cu.event_destroy(ev0)
-            cu.event_destroy(ev1)
+        t0 = time.time()
+        cu.launch(fn, grid, block, stream, out_ptr, probe)
+        cu.stream_sync(stream)
+        ms = (time.time() - t0) * 1000.0
         if ms >= 8.0:
             iters = int(round(probe * target_ms / ms))
             iters = max(1000, min(iters, 2000000000))
@@ -597,7 +575,6 @@ class Burner(object):
         self.nvml = None
         self.ctx = None
         self.stream = None
-        self.events = []
         self.module = None
         self.fn = None
         self.chunks = []
@@ -613,9 +590,7 @@ class Burner(object):
         self.grid = 1
         self.iters = 0
         self.streams = []
-        self.ev_ring = []
-        self.ev_idx = []
-        self.ev_fill = []
+        self.inflight = []
         self.depth = 4
         self.churn_thread = None
         self._closed = False
@@ -691,19 +666,12 @@ class Burner(object):
         self.log("发射配置: grid=%d  block=%d  streams=%d  iters=%d"
                  % (self.grid, self.block, args.streams, self.iters))
 
-        # 每个 stream 一组 event 用来限流（保证队列里始终有活，但不会无限堆积）
+        # 每个 stream 用 in-flight 计数限流（保证队列里始终有活，但不会无限堆积）
         self.streams = [self.stream]
         for _ in range(args.streams - 1):
             self.streams.append(cu.stream_create())
         self.depth = max(2, args.queue_depth)
-        self.events = []
-        self.ev_ring = []
-        for _ in range(len(self.streams)):
-            ring = [cu.event_create() for _ in range(self.depth)]
-            self.ev_ring.append(ring)
-            self.events.extend(ring)
-        self.ev_idx = [0] * len(self.streams)
-        self.ev_fill = [0] * len(self.streams)
+        self.inflight = [0] * len(self.streams)
 
         if args.churn:
             self._start_churn()
@@ -728,7 +696,6 @@ class Burner(object):
         n -= n % 4
         cu = self.cu
         stream = cu.stream_create()
-        evs = [cu.event_create() for _ in range(2)]
 
         def run():
             cu.ctx_set_current(self.ctx)
@@ -739,10 +706,9 @@ class Burner(object):
                         cu.memcpy_dtod_async(a[0], b[0], n, stream)
                     else:
                         cu.memcpy_dtod_async(b[0], a[0], n, stream)
-                    cu.event_record(evs[idx % 2], stream)
                     idx += 1
-                    if idx >= 2:
-                        cu.event_sync(evs[idx % 2])
+                    if idx % 2 == 0:
+                        cu.stream_sync(stream)
             except GpuBurnError as exc:
                 self.log("WARN: churn 线程退出: %s" % exc)
             finally:
@@ -767,15 +733,13 @@ class Burner(object):
             while not self.stop.is_set():
                 for i, stream in enumerate(self.streams):
                     cu.launch(self.fn, self.grid, self.block, stream, out_ptr, self.iters)
-                    cu.event_record(self.ev_ring[i][self.ev_idx[i]], stream)
                     self.launches += 1
-                    j = self.ev_idx[i]
-                    self.ev_idx[i] = (j + 1) % self.depth
-                    self.ev_fill[i] += 1
-                    # 队列里排满 depth 个之后就开始等最老的那个完成：GPU 永远有活干，
-                    # 同时内存里不会堆积无限多个待执行 kernel。
-                    if self.ev_fill[i] > self.depth:
-                        cu.event_sync(self.ev_ring[i][self.ev_idx[i]])
+                    self.inflight[i] += 1
+                    # 每个 stream 排满 depth 个 kernel 就等这一批跑完：GPU 永远有活干，
+                    # 同时不会把无限的 kernel 堆在驱动队列里。
+                    if self.inflight[i] >= self.depth:
+                        cu.stream_sync(stream)
+                        self.inflight[i] = 0
                 if args.duration > 0 and (time.time() - self.started) >= args.duration:
                     self.log("到达 --duration %.0fs，主动收工" % args.duration)
                     break
@@ -835,9 +799,6 @@ class Burner(object):
         if self.sink is not None:
             cu.mem_free(self.sink[0])
             self.sink = None
-        for e in self.events:
-            cu.event_destroy(e)
-        self.events, self.ev_ring = [], []
         # self.streams[0] 就是分配/标定用的 self.stream，统一在这里销毁一次
         for s in self.streams:
             cu.stream_destroy(s)
@@ -889,6 +850,7 @@ def build_parser():
     p.add_argument("--churn", action="store_true", help="另起线程做 D2D 拷贝，把显存带宽也刷起来")
     p.add_argument("--churn-mb", type=int, default=512, metavar="MB", help="churn 单次拷贝大小(默认 512)")
     p.add_argument("--check", action="store_true", help="只做环境自检和短时试跑，然后退出")
+    p.add_argument("--diag", action="store_true", help="逐步检查驱动/CUDA 链路（排障用）")
     p.add_argument("--dump-ptx", action="store_true",
                    help="打印实际交给驱动的 PTX 文本后退出（调试/校验用）")
     p.add_argument("--quiet", action="store_true", help="只打错误")
@@ -932,6 +894,9 @@ def main(argv=None):
     code = 0
     try:
         log("gpu_burn %s，pid %d" % (VERSION, os.getpid()))
+        if args.diag:
+            _diag(args, log)
+            return 0
         if args.check:
             _self_check(args, log)
             return 0
@@ -955,6 +920,87 @@ def main(argv=None):
     return code
 
 
+def _diag(args, log):
+    """--diag：把整条链路拆成一步一步，哪一步炸就停在哪一步（真机排障用）。"""
+    cu = Cuda(log)
+    log("驱动库: %s" % cu.libpath)
+    dv = cu.driver_version()
+    if dv:
+        log("驱动 API 版本: %d.%d" % dv)
+    state = {"step": 0}
+
+    def step(desc, fn, *a):
+        state["step"] += 1
+        try:
+            r = fn(*a)
+        except GpuBurnError as exc:
+            log("ERR: diag %d) %s 失败: %s" % (state["step"], desc, exc))
+            log("提示: 设备侧错误时，最后一条 OK 之后的那次调用出问题了；"
+                "可以再试 --threads 128 --blocks-per-sm 1 --iters 2000")
+            raise SystemExit(3)
+        log("diag %d) %s: OK" % (state["step"], desc))
+        return r
+
+    def alloc(nbytes):
+        rc, ptr = cu.try_mem_alloc(nbytes)
+        if rc != CUDA_SUCCESS:
+            raise GpuBurnError("cuMemAlloc: %s" % cu.error_str(rc))
+        return ptr
+
+    ctx = stream = module = None
+    ptr_sink = ptr_chunk = 0
+    try:
+        n = step("cuInit", cu.init)
+        log("     可见设备数: %d" % n)
+        if args.device >= n:
+            log("ERR: diag: --device %d 越界，本机只有 %d 张卡" % (args.device, n))
+            raise SystemExit(3)
+        dev = step("cuDeviceGet", cu.device, args.device)
+        sms = cu.attr(dev, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT) or 1
+        max_threads = cu.attr(dev, CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK) or 1024
+        log("diag 4) 设备属性: %s sm_%s%s %d SM maxThreads/block=%d"
+            % (cu.device_name(dev),
+               cu.attr(dev, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR),
+               cu.attr(dev, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR), sms, max_threads))
+        ctx = step("cuCtxCreate", cu.ctx_create, dev)
+        stream = step("cuStreamCreate", cu.stream_create)
+        ptr_sink = step("cuMemAlloc 4KiB 输出缓冲", alloc, 4096)
+        ptr_chunk = step("cuMemAlloc 64MiB", alloc, 64 << 20)
+        step("cuMemsetD32Async 64MiB", cu.memset_d32_async, ptr_chunk, (64 << 20) // 4, stream)
+        step("cuStreamSynchronize（等 memset 落地）", cu.stream_sync, stream)
+        module, fn, variant = step("PTX JIT（cuModuleLoadData + cuModuleGetFunction）",
+                                   cu.load_kernel, ptr_sink)
+        log("     JIT 用的是 %s" % variant)
+        step("小规模 launch（grid=SM block=32 iters=1000）",
+             cu.launch, fn, sms, 32, stream, ptr_sink, 1000)
+        step("cuStreamSynchronize（小规模 kernel）", cu.stream_sync, stream)
+        block = min(args.threads, max_threads)
+        block -= block % 32
+        grid = max(1, sms * max(1, args.blocks_per_sm))
+        t0 = time.time()
+        step("满规模 launch（grid=SM*blocks-per-sm iters=20000）",
+             cu.launch, fn, grid, block, stream, ptr_sink, 20000)
+        step("cuStreamSynchronize（满规模 kernel）", cu.stream_sync, stream)
+        log("     满规模 kernel 耗时 %.1f ms（grid=%d block=%d）"
+            % ((time.time() - t0) * 1000.0, grid, block))
+        log("diag 完成：从驱动到 kernel 这条链路可以跑")
+    finally:
+        if module is not None:
+            cu.module_unload(module)
+        if ptr_chunk:
+            cu.mem_free(ptr_chunk)
+        if ptr_sink:
+            cu.mem_free(ptr_sink)
+        if stream is not None:
+            cu.stream_destroy(stream)
+        if ctx is not None:
+            try:
+                cu.ctx_sync()
+            except GpuBurnError:
+                pass
+            cu.ctx_destroy(ctx)
+
+
 def _self_check(args, log):
     """--check：不常驻，只验证「驱动可见 / 能分配显存 / PTX 能 JIT / kernel 能跑」。"""
     cu = Cuda(log)
@@ -973,7 +1019,7 @@ def _self_check(args, log):
            cu.attr(dev, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR),
            cu.attr(dev, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR), sms))
     ctx = cu.ctx_create(dev)
-    stream = module = ev0 = ev1 = None
+    stream = module = None
     ptr = 0
     try:
         free, total = cu.mem_info()
@@ -990,13 +1036,11 @@ def _self_check(args, log):
         log("PTX JIT: OK（%s）" % variant)
         grid = max(1, sms * 8)
         iters = calibrate(cu, fn, grid, 256, stream, out_ptr, 50.0, log)
-        ev0, ev1 = cu.event_create(), cu.event_create()
-        cu.event_record(ev0, stream)
+        t0 = time.time()
         cu.launch(fn, grid, 256, stream, out_ptr, iters)
-        cu.event_record(ev1, stream)
-        cu.event_sync(ev1)
+        cu.stream_sync(stream)
         log("kernel 试跑: OK，grid=%d block=256 iters=%d，耗时 %.1f ms"
-            % (grid, iters, cu.event_elapsed_ms(ev0, ev1)))
+            % (grid, iters, (time.time() - t0) * 1000.0))
         nv = Nvml(args.device, log)
         if nv.ok:
             s = nv.stats() or {}
@@ -1005,9 +1049,6 @@ def _self_check(args, log):
         else:
             log("NVML: 不可用（不影响刷，只是没有利用率数字可看）")
     finally:
-        for e in (ev0, ev1):
-            if e is not None:
-                cu.event_destroy(e)
         if module is not None:
             cu.module_unload(module)
         if stream is not None:

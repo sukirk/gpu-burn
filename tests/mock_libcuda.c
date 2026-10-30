@@ -55,6 +55,10 @@ static int g_sms = 108;
 static const char *g_name = "Mock A100-SXM4-80GB";
 static double g_speed = 1.5e12;      /* 线程-迭代数/秒，逼近 A100 FP32 峰值 */
 static size_t g_oom_after = 0;       /* 非 0：used 超过它之后一律 OOM */
+static int g_fail_launch_at = 0;     /* 非 0：第 N 次 cuLaunchKernel 注入错误 */
+static int g_fail_code = 999;        /* 注入的错误码（999 = CUDA_ERROR_UNKNOWN） */
+static int g_launch_calls = 0;
+static int g_sticky = 0;             /* 注入后模拟上下文丢失：后续调用也跟着失败 */
 static FILE *g_log;
 
 typedef struct { CUdeviceptr ptr; size_t size; int used; } alloc_t;
@@ -125,6 +129,12 @@ static void env_init(void)
         g_speed = atof(s);
     if ((s = getenv("MOCK_OOM_AFTER_GB")))
         g_oom_after = (size_t)(atof(s) * (double)(1ull << 30));
+    if ((s = getenv("MOCK_USED_GB")))     /* 模拟「被别的进程占掉」的显存 */
+        g_used = (size_t)(atof(s) * (double)(1ull << 30));
+    if ((s = getenv("MOCK_FAIL_LAUNCH_AT")))
+        g_fail_launch_at = atoi(s);
+    if ((s = getenv("MOCK_FAIL_CODE")))
+        g_fail_code = atoi(s);
     if ((s = getenv("MOCK_LOG")))
         g_log = fopen(s, "a");
     vlog("mock: init total=%zu sms=%d name=%s", g_total, g_sms, g_name);
@@ -269,6 +279,8 @@ CUresult cuCtxSetCurrent(CUcontext ctx)
 
 CUresult cuCtxSynchronize(void)
 {
+    if (g_sticky)
+        return g_sticky;
     double t = 0;
     for (int i = 0; i < g_nstreams; i++)
         if (g_streams[i]->busy_until > t)
@@ -404,6 +416,15 @@ CUresult cuLaunchKernel(CUfunction fn, unsigned int gx, unsigned int gy, unsigne
                         unsigned int shared, CUstream s, void **params, void **extra)
 {
     (void)gy; (void)gz; (void)by; (void)bz; (void)shared; (void)extra;
+    if (g_sticky)
+        return g_sticky;
+    g_launch_calls++;
+    if (g_fail_launch_at > 0 && g_launch_calls == g_fail_launch_at) {
+        g_sticky = g_fail_code;
+        vlog("mock: cuLaunchKernel 第 %d 次调用注入设备侧错误 %d（上下文丢失）", g_launch_calls,
+             g_fail_code);
+        return g_sticky;
+    }
     if (!fn || !params)
         return E_INVALID_VALUE;
     if (gx == 0 || bx == 0 || bx > 1024)
@@ -457,6 +478,8 @@ CUresult cuStreamDestroy_v2(CUstream s)
 
 CUresult cuStreamSynchronize(CUstream s)
 {
+    if (g_sticky)
+        return g_sticky;
     mock_stream_t *m = as_stream(s);
     if (!m)
         return E_INVALID_HANDLE;

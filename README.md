@@ -100,6 +100,7 @@ docker run --gpus all -it -v "$PWD":/opt/gpu-burn <你的镜像> \
 ./gpu_burn --churn --stats 2        # 顺带刷显存带宽，2 秒报一次
 ./gpu_burn --streams 4 --queue-depth 8   # 4 个 stream 并发，队列排深一点
 ./gpu_burn --check                  # 只自检，不常驻
+./gpu_burn --diag                   # 逐步检查驱动 → 显存 → JIT → kernel，排障用
 ./gpu_burn --device 1               # 用第二张卡
 ```
 
@@ -123,6 +124,7 @@ docker run --gpus all -it -v "$PWD":/opt/gpu-burn <你的镜像> \
   --churn             另起线程做 D2D 拷贝，把显存带宽也刷起来
   --churn-mb MB       churn 单次拷贝大小（默认 512）
   --check             只做环境自检和短时试跑，然后退出
+  --diag              逐步检查驱动/CUDA 链路，打印每一步的结果（排障用）
   --quiet             只打错误
   --version           打印版本
   -h, --help          打印本页
@@ -139,6 +141,11 @@ docker run --gpus all -it -v "$PWD":/opt/gpu-burn <你的镜像> \
 
 一次 `--check` 会依次验证：驱动库能否加载 → 设备可见 → 能分配并写入 256MiB 显存 →
 PTX 能被 JIT → kernel 能执行。哪一步失败会直接给出要查的东西。
+
+`--diag` 把同一条链路拆成 15 步（`cuInit`、取设备、建上下文、建 stream、分配、memset、
+JIT、小规模 launch、满规模 launch……），每一步单独打印 OK/失败，适合在真卡上定位
+"到底哪一步不行"。所有 CUDA 报错都带错误码（例如 `unknown (rc=999)`），
+`rc=999` / `rc=719` / `rc=700` 基本都是设备侧错误（kernel 非法访问、上下文丢失）。
 
 ### 退出码与信号
 
@@ -219,6 +226,7 @@ A100 80GB 单卡，`--mem-pct 0.60` 时：
 | 可占显存太少 | 卡上已有别的进程，用 `--mem-gb` 给小一点 |
 | 统计行没有温度/功耗 | 容器里没有 `libnvidia-ml.so.1`，不影响刷 |
 | `所有 PTX 版本都不能被驱动接受` | 驱动太老（早于 CUDA 11），升级宿主机驱动 |
+| `标定失败`、`rc=999`/`rc=719`/`rc=700`、`上下文已丢失` | 设备侧错误。先跑 `--diag` 看卡在哪一步；能过 `--diag` 但刷的时候挂，试 `--streams 1 --queue-depth 2`，或先把卡上别的进程清掉。1.0.0 里标定用的是 CUDA event 计时，在少数共享/虚拟化环境会直接报错，**1.0.1 起改成 host 时钟 + stream 同步，不再依赖 event** |
 | 想知道实际刷到什么程度 | 另开终端 `nvidia-smi -l 1`，或本程序 `--stats 1` |
 | 想换成更小的显存占用 | `--mem-pct 0.3` 或 `--mem-gb 16` |
 

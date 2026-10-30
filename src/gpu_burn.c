@@ -22,7 +22,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define VERSION "1.0.0"
+#define VERSION "1.0.1"
 
 /* ------------------------------------------------------------------------- */
 /* CUDA Driver API 的最小类型/常量定义（避免依赖 cuda.h）                      */
@@ -276,11 +276,6 @@ static struct {
     CUresult (*cuStreamCreate)(CUstream *, unsigned);
     CUresult (*cuStreamDestroy)(CUstream);
     CUresult (*cuStreamSynchronize)(CUstream);
-    CUresult (*cuEventCreate)(CUevent *, unsigned);
-    CUresult (*cuEventRecord)(CUevent, CUstream);
-    CUresult (*cuEventSynchronize)(CUevent);
-    CUresult (*cuEventElapsedTime)(float *, CUevent, CUevent);
-    CUresult (*cuEventDestroy)(CUevent);
     CUresult (*cuGetErrorString)(CUresult, const char **);
 } g_cu;
 
@@ -350,11 +345,6 @@ static int load_driver(void)
         BIND(cuStreamCreate, "cuStreamCreate");
         BIND(cuStreamDestroy, "cuStreamDestroy");
         BIND(cuStreamSynchronize, "cuStreamSynchronize");
-        BIND(cuEventCreate, "cuEventCreate");
-        BIND(cuEventRecord, "cuEventRecord");
-        BIND(cuEventSynchronize, "cuEventSynchronize");
-        BIND(cuEventElapsedTime, "cuEventElapsedTime");
-        BIND(cuEventDestroy, "cuEventDestroy");
         BIND(cuGetErrorString, "cuGetErrorString");
 
         g_driver_loaded = 1;
@@ -372,12 +362,26 @@ static int load_driver(void)
     return 0;
 }
 
+/* CUDA 错误码带上数字：驱动对某些码只回 "unknown"，没有数字就无从查起 */
 static const char *cu_err(CUresult rc)
 {
+    static char bufs[8][192];
+    static int slot;
+    char *buf = bufs[slot = (slot + 1) & 7];
     const char *s = NULL;
-    if (g_cu.cuGetErrorString && g_cu.cuGetErrorString(rc, &s) == CUDA_SUCCESS && s)
-        return s;
-    return "unknown";
+    if (!g_cu.cuGetErrorString || g_cu.cuGetErrorString(rc, &s) != CUDA_SUCCESS || !s)
+        s = "unknown";
+    snprintf(buf, sizeof bufs[0], "%s (rc=%d)", s, (int)rc);
+    return buf;
+}
+
+/* 设备侧错误（非法访问 / 上下文丢失）的提示，省得用户对着 unknown 发呆 */
+static void cuda_fail(const char *what, CUresult rc)
+{
+    errmsg("%s: %s", what, cu_err(rc));
+    if ((int)rc == 999 || (int)rc == 719 || (int)rc == 700)
+        errmsg("提示: 这是设备侧错误（kernel 非法访问 / 上下文丢失 / 驱动异常），"
+               "加 --diag 逐步检查能找到失败的那一步");
 }
 
 /* ------------------------------------------------------------------------- */
@@ -404,6 +408,7 @@ typedef struct {
     int churn;
     int churn_mb;
     int check;
+    int diag;
 } Args;
 
 static struct Runtime {
@@ -412,9 +417,7 @@ static struct Runtime {
     CUfunction fn;
     CUstream streams[MAX_STREAMS];
     int nstreams;
-    CUevent ev[MAX_STREAMS][MAX_DEPTH];
-    int ev_idx[MAX_STREAMS];
-    int ev_fill[MAX_STREAMS];
+    int inflight[MAX_STREAMS];
     int depth;
     Chunk *chunks;
     int nchunks;
@@ -549,12 +552,16 @@ static void touch_vram(void)
         }
         total += R.chunks[i].size;
         if ((i + 1) % 8 == 0 || i + 1 == R.nchunks) {
-            g_cu.cuStreamSynchronize(R.streams[0]);
+            rc = g_cu.cuStreamSynchronize(R.streams[0]);
+            if (rc != CUDA_SUCCESS) {
+                cuda_fail("写入显存后同步失败", rc);
+                cleanup_all();
+                exit(3);
+            }
             logmsg("  已写入 %s / %s", human(b1, sizeof b1, total),
                    human(b2, sizeof b2, R.got));
         }
     }
-    g_cu.cuStreamSynchronize(R.streams[0]);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -608,32 +615,30 @@ static CUresult launch(CUstream s, uint32_t iters)
                                params, NULL);
 }
 
+/* 用 host 时钟 + stream 同步给一次 kernel 计时：不碰 event API，
+   驱动面小一层，某些虚拟化/共享环境下 event 计时会直接报错。 */
+static double timed_kernel_ms(uint32_t iters, CUresult *err)
+{
+    double t0 = now_s();
+    CUresult rc = launch(R.streams[0], iters);
+    if (rc == CUDA_SUCCESS)
+        rc = g_cu.cuStreamSynchronize(R.streams[0]);
+    double ms = (now_s() - t0) * 1000.0;
+    if (err)
+        *err = rc;
+    return ms;
+}
+
 /* 试跑几次，把每线程迭代数标定到目标时长（换卡不用改参数） */
 static uint32_t calibrate(double target_ms)
 {
-    double probe = 200000.0;
+    double probe = 20000.0;
     for (int round = 0; round < 4; round++) {
-        CUevent e0 = NULL, e1 = NULL;
-        float ms = 0.0f;
-        CUresult rc = g_cu.cuEventCreate(&e0, 0);
-        if (rc == CUDA_SUCCESS)
-            rc = g_cu.cuEventCreate(&e1, 0);
-        if (rc == CUDA_SUCCESS)
-            rc = g_cu.cuEventRecord(e0, R.streams[0]);
-        if (rc == CUDA_SUCCESS)
-            rc = launch(R.streams[0], (uint32_t)probe);
-        if (rc == CUDA_SUCCESS)
-            rc = g_cu.cuEventRecord(e1, R.streams[0]);
-        if (rc == CUDA_SUCCESS)
-            rc = g_cu.cuEventSynchronize(e1);
-        if (rc == CUDA_SUCCESS)
-            rc = g_cu.cuEventElapsedTime(&ms, e0, e1);
-        if (e0)
-            g_cu.cuEventDestroy(e0);
-        if (e1)
-            g_cu.cuEventDestroy(e1);
+        CUresult rc = CUDA_SUCCESS;
+        double measured = timed_kernel_ms((uint32_t)probe, &rc);
+        float ms = (float)measured;
         if (rc != CUDA_SUCCESS) {
-            errmsg("标定失败: %s", cu_err(rc));
+            cuda_fail("标定失败", rc);
             cleanup_all();
             exit(3);
         }
@@ -676,15 +681,12 @@ static void *churn_main(void *arg)
 {
     ChurnArg *ca = (ChurnArg *)arg;
     CUstream s = NULL;
-    CUevent ev[2] = {NULL, NULL};
     if (g_cu.cuCtxSetCurrent(R.ctx) != CUDA_SUCCESS) {
         warnmsg("churn 线程无法绑定上下文");
         return NULL;
     }
     if (g_cu.cuStreamCreate(&s, 0) != CUDA_SUCCESS)
         return NULL;
-    g_cu.cuEventCreate(&ev[0], 0);
-    g_cu.cuEventCreate(&ev[1], 0);
     int idx = 0;
     while (!g_stop) {
         CUdeviceptr dst = (idx % 2 == 0) ? ca->a : ca->b;
@@ -693,19 +695,16 @@ static void *churn_main(void *arg)
             warnmsg("churn 拷贝失败，线程退出");
             break;
         }
-        g_cu.cuEventRecord(ev[idx % 2], s);
         idx++;
-        if (idx >= 2)
-            g_cu.cuEventSynchronize(ev[idx % 2]);
+        if (idx % 2 == 0 && g_cu.cuStreamSynchronize(s) != CUDA_SUCCESS) {
+            warnmsg("churn 同步失败，线程退出");
+            break;
+        }
     }
-    if (s)
+    if (s) {
         g_cu.cuStreamSynchronize(s);
-    if (ev[0])
-        g_cu.cuEventDestroy(ev[0]);
-    if (ev[1])
-        g_cu.cuEventDestroy(ev[1]);
-    if (s)
         g_cu.cuStreamDestroy(s);
+    }
     return NULL;
 }
 
@@ -772,12 +771,6 @@ static void cleanup_all(void)
         g_cu.cuMemFree(R.sink);
         R.sink = 0;
     }
-    for (int i = 0; i < R.nstreams; i++)
-        for (int j = 0; j < R.depth; j++)
-            if (R.ev[i][j]) {
-                g_cu.cuEventDestroy(R.ev[i][j]);
-                R.ev[i][j] = NULL;
-            }
     for (int i = 0; i < R.nstreams; i++)
         if (R.streams[i]) {
             g_cu.cuStreamDestroy(R.streams[i]);
@@ -941,17 +934,8 @@ static void setup(const Args *a)
     R.depth = a->queue_depth >= 2 ? a->queue_depth : 2;
     if (R.depth > MAX_DEPTH)
         R.depth = MAX_DEPTH;
-    for (int i = 0; i < R.nstreams; i++) {
-        for (int j = 0; j < R.depth; j++) {
-            rc = g_cu.cuEventCreate(&R.ev[i][j], 0);
-            if (rc != CUDA_SUCCESS) {
-                errmsg("创建 event 失败: %s", cu_err(rc));
-                exit(3);
-            }
-        }
-        R.ev_idx[i] = 0;
-        R.ev_fill[i] = 0;
-    }
+    for (int i = 0; i < R.nstreams; i++)
+        R.inflight[i] = 0;
 
     /* NVML 只是锦上添花：拿不到就别打那几个字段 */
     if (load_nvml() && g_nvml.Init() == 0 &&
@@ -1006,29 +990,22 @@ static void run_loop(const Args *a)
             if (rc != CUDA_SUCCESS) {
                 if (g_stop)
                     break;
-                errmsg("kernel 发射失败: %s", cu_err(rc));
-                cleanup_all();
-                exit(3);
-            }
-            rc = g_cu.cuEventRecord(R.ev[i][R.ev_idx[i]], R.streams[i]);
-            if (rc != CUDA_SUCCESS) {
-                errmsg("cuEventRecord 失败: %s", cu_err(rc));
+                cuda_fail("kernel 发射失败", rc);
                 cleanup_all();
                 exit(3);
             }
             R.launches++;
-            int j = R.ev_idx[i];
-            R.ev_idx[i] = (j + 1) % R.depth;
-            R.ev_fill[i]++;
-            /* 队列里排满 depth 个之后就开始等最老的那个完成：GPU 永远有活干，
-               同时内存里不会堆积无限多个待执行 kernel。 */
-            if (R.ev_fill[i] > R.depth) {
-                rc = g_cu.cuEventSynchronize(R.ev[i][R.ev_idx[i]]);
+            R.inflight[i]++;
+            /* 每个 stream 排满 depth 个 kernel 就等这一批跑完：GPU 永远有活干，
+               同时不会把无限的 kernel 堆在驱动队列里。 */
+            if (R.inflight[i] >= R.depth) {
+                rc = g_cu.cuStreamSynchronize(R.streams[i]);
                 if (rc != CUDA_SUCCESS && !g_stop) {
-                    errmsg("kernel 执行失败: %s", cu_err(rc));
+                    cuda_fail("kernel 执行失败", rc);
                     cleanup_all();
                     exit(3);
                 }
+                R.inflight[i] = 0;
             }
         }
         double now = now_s();
@@ -1042,6 +1019,114 @@ static void run_loop(const Args *a)
         }
     }
 }
+
+/* ------------------------------------------------------------------------- */
+/* --diag：把整条链路拆成一步一步，哪一步炸就停在哪一步（真机排障用）          */
+/* ------------------------------------------------------------------------- */
+
+static void diag_err(int step, const char *what, CUresult rc)
+{
+    errmsg("diag %d) %s 失败: %s", step, what, cu_err(rc));
+    if ((int)rc == 999 || (int)rc == 719 || (int)rc == 700)
+        errmsg("提示: 设备侧错误。上面最后一条 OK 之后的那次调用出问题了；"
+               "可以再试 --threads 128 --blocks-per-sm 1 --iters 2000");
+}
+
+#define DIAG_STEP(no, what, expr)                                              \
+    do {                                                                       \
+        CUresult _rc = (expr);                                                \
+        if (_rc != CUDA_SUCCESS) {                                            \
+            diag_err((no), (what), _rc);                                      \
+            cleanup_all();                                                    \
+            exit(3);                                                          \
+        }                                                                     \
+        logmsg("diag %d) %s: OK", (no), (what));                              \
+    } while (0)
+
+static void diag(const Args *a)
+{
+    int drv = 0;
+    if (g_cu.cuDriverGetVersion(&drv) == CUDA_SUCCESS)
+        logmsg("驱动 API 版本: %d.%d", drv / 1000, (drv % 1000) / 10);
+
+    DIAG_STEP(1, "cuInit", g_cu.cuInit(0));
+
+    int count = 0;
+    DIAG_STEP(2, "cuDeviceGetCount", g_cu.cuDeviceGetCount(&count));
+    logmsg("     可见设备数: %d", count);
+    if (count <= 0) {
+        errmsg("diag: 没有可见的 GPU");
+        exit(3);
+    }
+    if (a->device < 0 || a->device >= count) {
+        errmsg("diag: --device %d 超出范围（共 %d 张卡）", a->device, count);
+        exit(3);
+    }
+    CUdevice dev = 0;
+    DIAG_STEP(3, "cuDeviceGet", g_cu.cuDeviceGet(&dev, a->device));
+
+    char name[256] = "";
+    if (g_cu.cuDeviceGetName(name, (int)sizeof name, dev) != CUDA_SUCCESS)
+        name[0] = '\0';
+    int cc_major = 0, cc_minor = 0;
+    g_cu.cuDeviceGetAttribute(&cc_major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, dev);
+    g_cu.cuDeviceGetAttribute(&cc_minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, dev);
+    g_cu.cuDeviceGetAttribute(&R.sms, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, dev);
+    g_cu.cuDeviceGetAttribute(&R.max_threads, CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK, dev);
+    if (R.max_threads <= 0)
+        R.max_threads = 1024;
+    logmsg("diag 4) 设备属性: %s sm_%d%d %d SM maxThreads/block=%d", name[0] ? name : "未知",
+           cc_major, cc_minor, R.sms, R.max_threads);
+
+    DIAG_STEP(5, "cuCtxCreate", g_cu.cuCtxCreate(&R.ctx, 0, dev));
+    DIAG_STEP(6, "cuStreamCreate", g_cu.cuStreamCreate(&R.streams[0], 0));
+    R.nstreams = 1;
+
+    R.sink_bytes = 4096;
+    DIAG_STEP(7, "cuMemAlloc 4KiB 输出缓冲",
+              g_cu.cuMemAlloc(&R.sink, R.sink_bytes));
+
+    size_t probe = 64u * MB;
+    CUdeviceptr p = 0;
+    DIAG_STEP(8, "cuMemAlloc 64MiB",
+              g_cu.cuMemAlloc(&p, probe));
+    add_chunk(p, probe);
+
+    DIAG_STEP(9, "cuMemsetD32Async 64MiB",
+              g_cu.cuMemsetD32Async(p, 0, probe / 4, R.streams[0]));
+    DIAG_STEP(10, "cuStreamSynchronize（等 memset 落地）",
+              g_cu.cuStreamSynchronize(R.streams[0]));
+
+    if (!load_kernel()) {
+        errmsg("diag 11) PTX JIT 失败");
+        cleanup_all();
+        exit(3);
+    }
+    logmsg("diag 11) PTX JIT（cuModuleLoadData + cuModuleGetFunction）: OK");
+
+    R.block = 32;
+    R.grid = R.sms > 0 ? R.sms : 1;
+    DIAG_STEP(12, "小规模 launch（grid=SM block=32 iters=1000）",
+              launch(R.streams[0], 1000));
+    DIAG_STEP(13, "cuStreamSynchronize（小规模 kernel）",
+              g_cu.cuStreamSynchronize(R.streams[0]));
+
+    R.block = a->threads > R.max_threads ? R.max_threads : a->threads;
+    R.block -= R.block % 32;
+    R.grid = (R.sms > 0 ? R.sms : 1) * (a->blocks_per_sm > 0 ? a->blocks_per_sm : 1);
+    double t0 = now_s();
+    DIAG_STEP(14, "满规模 launch（grid=SM*blocks-per-sm iters=20000）",
+              launch(R.streams[0], 20000));
+    DIAG_STEP(15, "cuStreamSynchronize（满规模 kernel）",
+              g_cu.cuStreamSynchronize(R.streams[0]));
+    logmsg("     满规模 kernel 耗时 %.1f ms（grid=%d block=%d）", (now_s() - t0) * 1000.0,
+           R.grid, R.block);
+
+    cleanup_all();
+    logmsg("diag 完成：从驱动到 kernel 这条链路可以跑");
+}
+
+#undef DIAG_STEP
 
 /* ------------------------------------------------------------------------- */
 /* --check：不常驻，只验证「驱动可见 / 能分配显存 / PTX 能 JIT / kernel 能跑」  */
@@ -1119,27 +1204,13 @@ static void self_check(const Args *a)
     R.grid = R.sms * a->blocks_per_sm;
     uint32_t iters = calibrate(50.0);
 
-    CUevent e0 = NULL, e1 = NULL;
-    float ms = 0.0f;
-    g_cu.cuEventCreate(&e0, 0);
-    g_cu.cuEventCreate(&e1, 0);
-    g_cu.cuEventRecord(e0, R.streams[0]);
-    rc = launch(R.streams[0], iters);
+    double ms = timed_kernel_ms(iters, &rc);
     if (rc != CUDA_SUCCESS) {
-        errmsg("试跑 kernel 失败: %s", cu_err(rc));
+        cuda_fail("试跑 kernel 失败", rc);
         exit(3);
     }
-    g_cu.cuEventRecord(e1, R.streams[0]);
-    rc = g_cu.cuEventSynchronize(e1);
-    if (rc != CUDA_SUCCESS) {
-        errmsg("试跑 kernel 执行失败: %s", cu_err(rc));
-        exit(3);
-    }
-    g_cu.cuEventElapsedTime(&ms, e0, e1);
     logmsg("kernel 试跑: OK，grid=%d block=%d iters=%u，耗时 %.1f ms", R.grid, R.block, iters,
-           (double)ms);
-    g_cu.cuEventDestroy(e0);
-    g_cu.cuEventDestroy(e1);
+           ms);
 
     if (load_nvml() && g_nvml.Init() == 0 &&
         g_nvml.GetHandleByIndex((unsigned)a->device, &g_nvml.dev) == 0) {
@@ -1198,6 +1269,7 @@ static void usage(FILE *out)
             "  --churn             另起线程做 D2D 拷贝，把显存带宽也刷起来\n"
             "  --churn-mb MB       churn 单次拷贝大小（默认 512）\n"
             "  --check             只做环境自检和短时试跑，然后退出\n"
+            "  --diag              逐步检查驱动/CUDA 链路，打印每一步的结果（排障用）\n"
             "  --quiet             只打错误\n"
             "  --version           打印版本\n"
             "  -h, --help          打印本页\n"
@@ -1244,6 +1316,7 @@ int main(int argc, char **argv)
         {"churn", no_argument, 0, 'c'},
         {"churn-mb", required_argument, 0, 'C'},
         {"check", no_argument, 0, 'k'},
+        {"diag", no_argument, 0, 'X'},
         {"quiet", no_argument, 0, 'Q'},
         {"dump-ptx", no_argument, 0, 'P'},
         {"version", no_argument, 0, 'V'},
@@ -1268,6 +1341,7 @@ int main(int argc, char **argv)
         case 'c': a.churn = 1; break;
         case 'C': a.churn_mb = atoi(optarg); break;
         case 'k': a.check = 1; break;
+        case 'X': a.diag = 1; break;
         case 'Q': g_quiet = 1; break;
         case 'P': {
             static char buf[4096];
@@ -1310,6 +1384,10 @@ int main(int argc, char **argv)
     if (!load_driver())
         return 2;
 
+    if (a.diag) {
+        diag(&a);
+        return 0;
+    }
     if (a.check) {
         self_check(&a);
         return 0;
