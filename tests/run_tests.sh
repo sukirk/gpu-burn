@@ -146,7 +146,20 @@ if [ -n "$BIN" ] && [ -x "$BIN" ]; then
 fi
 
 # --- 多卡：--devices / --devices all / 信号收尾不留孤儿 -------------------
-# multi_suite <标签> <可执行命令...>；进程名用于查残留（python 版查命令行）
+# 按命令行子串找进程。最小发行版镜像里常常没有 pgrep/ps，所以直接读 /proc。
+pids_matching() {
+    local pat="$1" d pid cmd
+    for d in /proc/[0-9]*; do
+        pid=${d#/proc/}
+        [ "$pid" = "$$" ] && continue
+        cmd=$({ tr '\0' ' ' <"$d/cmdline"; } 2>/dev/null) || continue
+        case "$cmd" in
+            *"$pat"*) printf '%s\n' "$pid" ;;
+        esac
+    done
+}
+
+# multi_suite <标签> <可执行命令...>；命令行子串用于查残留进程
 multi_suite() {
     local label="$1"
     shift
@@ -154,7 +167,7 @@ multi_suite() {
     local pattern
     case "$label" in
         python*) pattern="gpu_burn.py --devices" ;;
-        *)       pattern="^$ROOT/gpu_burn --devices" ;;
+        *)       pattern="$ROOT/gpu_burn --devices" ;;
     esac
 
     out="$TMP/${label}_multi.txt"
@@ -200,7 +213,7 @@ multi_suite() {
     code=$?
     sleep 1
     if [ "$code" -eq 0 ] && [ "$(grep -c "已释放显存与 CUDA 上下文" "$out")" -ge 2 ] \
-        && ! pgrep -f "$pattern" >/dev/null 2>&1; then
+        && [ -z "$(pids_matching "$pattern")" ]; then
         ok "$label SIGTERM 后两张卡都已释放、无残留进程"
     else
         bad "$label SIGTERM 多卡收尾（退出码 $code）"
@@ -214,12 +227,12 @@ multi_suite() {
     sleep 2
     kill -KILL "$pid" 2>/dev/null
     wait "$pid" 2>/dev/null
-    for _ in 1 2 3 4 5 6 7 8 9 10; do
-        pgrep -f "$pattern" >/dev/null 2>&1 || break
+    for _ in $(seq 1 20); do
+        [ -z "$(pids_matching "$pattern")" ] && break
         sleep 1
     done
     released=$(grep -c "已释放显存与 CUDA 上下文" "$out")
-    if [ "$released" -ge 2 ] && ! pgrep -f "$pattern" >/dev/null 2>&1; then
+    if [ "$released" -ge 2 ] && [ -z "$(pids_matching "$pattern")" ]; then
         ok "$label 父进程被 kill -9 后子进程仍自行释放（无孤儿）"
     else
         bad "$label 父进程 kill -9 后的收尾（释放 $released 个）"
