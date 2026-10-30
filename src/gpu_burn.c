@@ -15,8 +15,6 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
-#include <sys/prctl.h>
-#include <sys/wait.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,7 +22,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define VERSION "1.1.0"
+#define VERSION "1.1.1"
 
 /* ------------------------------------------------------------------------- */
 /* CUDA Driver API 的最小类型/常量定义（避免依赖 cuda.h）                      */
@@ -167,53 +165,74 @@ static volatile sig_atomic_t g_stop;
 static int g_quiet;
 static int g_driver_loaded;
 static int g_cleanup_quiet; /* --check 收尾时不要多打一行“已释放” */
-static int g_dev_tag = -1;  /* >=0 时日志里带上卡号：多卡模式下每个子进程一个 */
+static __thread int g_dev_tag = -1;  /* >=0 时日志里带上卡号：多卡模式下每张卡一个线程 */
+
+static pthread_mutex_t g_log_mu = PTHREAD_MUTEX_INITIALIZER;
+
+/* 多卡模式是几个线程一起打日志：整行先拼好、再一次性写出去，
+   否则两行会插到对方中间（"主动收工[gpu_burn 16:23:14 #1] 已释放..."）。 */
+static void vlog_line(FILE *fp, const char *pre, const char *fmt, va_list ap)
+{
+    char buf[1200];
+    int n = snprintf(buf, sizeof buf, "%s", pre);
+    if (n < 0 || (size_t)n >= sizeof buf)
+        n = 0;
+    int m = vsnprintf(buf + n, sizeof buf - (size_t)n, fmt, ap);
+    size_t len = (size_t)n + (m > 0 ? (size_t)m : 0);
+    if (len > sizeof buf - 2)
+        len = sizeof buf - 2;
+    buf[len++] = '\n';
+    pthread_mutex_lock(&g_log_mu);
+    fwrite(buf, 1, len, fp);
+    fflush(fp);
+    pthread_mutex_unlock(&g_log_mu);
+}
 
 static void logmsg(const char *fmt, ...)
 {
     if (g_quiet)
         return;
-    char ts[16];
+    char ts[16], pre[64];
     time_t t = time(NULL);
     struct tm tm;
     localtime_r(&t, &tm);
     strftime(ts, sizeof ts, "%H:%M:%S", &tm);
     if (g_dev_tag >= 0)
-        printf("[gpu_burn %s #%d] ", ts, g_dev_tag);
+        snprintf(pre, sizeof pre, "[gpu_burn %s #%d] ", ts, g_dev_tag);
     else
-        printf("[gpu_burn %s] ", ts);
+        snprintf(pre, sizeof pre, "[gpu_burn %s] ", ts);
     va_list ap;
     va_start(ap, fmt);
-    vprintf(fmt, ap);
+    vlog_line(stdout, pre, fmt, ap);
     va_end(ap);
-    putchar('\n');
-    fflush(stdout);
 }
 
 static void errmsg(const char *fmt, ...)
 {
-    fflush(stdout);
-    fprintf(stderr, g_dev_tag >= 0 ? "[gpu_burn #%d] ERR: " : "[gpu_burn] ERR: ", g_dev_tag);
+    char pre[64];
+    if (g_dev_tag >= 0)
+        snprintf(pre, sizeof pre, "[gpu_burn #%d] ERR: ", g_dev_tag);
+    else
+        snprintf(pre, sizeof pre, "[gpu_burn] ERR: ");
     va_list ap;
     va_start(ap, fmt);
-    vfprintf(stderr, fmt, ap);
+    vlog_line(stderr, pre, fmt, ap);
     va_end(ap);
-    fputc('\n', stderr);
-    fflush(stderr);
 }
 
 static void warnmsg(const char *fmt, ...)
 {
     if (g_quiet)
         return;
-    fflush(stdout);
-    fprintf(stderr, g_dev_tag >= 0 ? "[gpu_burn #%d] WARN: " : "[gpu_burn] WARN: ", g_dev_tag);
+    char pre[64];
+    if (g_dev_tag >= 0)
+        snprintf(pre, sizeof pre, "[gpu_burn #%d] WARN: ", g_dev_tag);
+    else
+        snprintf(pre, sizeof pre, "[gpu_burn] WARN: ");
     va_list ap;
     va_start(ap, fmt);
-    vfprintf(stderr, fmt, ap);
+    vlog_line(stderr, pre, fmt, ap);
     va_end(ap);
-    fputc('\n', stderr);
-    fflush(stderr);
 }
 
 static double now_s(void)
@@ -422,7 +441,7 @@ typedef struct {
     int diag;
 } Args;
 
-static struct Runtime {
+typedef struct Runtime {
     CUcontext ctx;
     CUmodule mod;
     CUfunction fn;
@@ -447,7 +466,13 @@ static struct Runtime {
     pthread_t churn_tid;
     int churn_started;
     int nvml_ok;
-} R;
+    int failed;     /* 本卡失败次数：只影响本线程，不拖累别的卡 */
+    int churn_stop; /* 通知 churn 线程收工（每张卡一个 churn 线程） */
+} Runtime;
+
+/* 一张卡一个线程，卡的状态放线程本地：CUDA 上下文是绑线程的，每张卡在自己
+   线程里建上下文、分配显存、发 kernel，互不干扰；进程退出时所有卡一起释放。 */
+static __thread Runtime R;
 
 /* NVML 是可选增强：拿不到就当没有，只影响统计行里多几项 */
 typedef struct {
@@ -461,7 +486,7 @@ typedef struct {
     unsigned long long used;
 } nvmlMemory_t;
 
-static struct {
+typedef struct {
     void *dll;
     int (*Init)(void);
     int (*Shutdown)(void);
@@ -471,7 +496,9 @@ static struct {
     int (*GetTemperature)(void *, int, unsigned int *);
     int (*GetPowerUsage)(void *, unsigned int *);
     void *dev;
-} g_nvml;
+} NvmlLib;
+
+static __thread NvmlLib g_nvml;
 
 static int load_nvml(void)
 {
@@ -559,7 +586,8 @@ static void touch_vram(void)
         if (rc != CUDA_SUCCESS) {
             errmsg("写入显存失败: %s", cu_err(rc));
             cleanup_all();
-            exit(3);
+            R.failed = 1;
+            return;
         }
         total += R.chunks[i].size;
         if ((i + 1) % 8 == 0 || i + 1 == R.nchunks) {
@@ -567,7 +595,8 @@ static void touch_vram(void)
             if (rc != CUDA_SUCCESS) {
                 cuda_fail("写入显存后同步失败", rc);
                 cleanup_all();
-                exit(3);
+                R.failed = 1;
+                return;
             }
             logmsg("  已写入 %s / %s", human(b1, sizeof b1, total),
                    human(b2, sizeof b2, R.got));
@@ -651,7 +680,8 @@ static uint32_t calibrate(double target_ms)
         if (rc != CUDA_SUCCESS) {
             cuda_fail("标定失败", rc);
             cleanup_all();
-            exit(3);
+            R.failed = 1;
+            return 0;
         }
         if (ms >= 8.0f) {
             double it = probe * target_ms / (double)ms;
@@ -686,20 +716,21 @@ typedef struct {
     CUdeviceptr a;
     CUdeviceptr b;
     size_t n;
+    Runtime *owner; /* churn 是独立线程，看不到发起它的那张卡的线程本地状态 */
 } ChurnArg;
 
 static void *churn_main(void *arg)
 {
     ChurnArg *ca = (ChurnArg *)arg;
     CUstream s = NULL;
-    if (g_cu.cuCtxSetCurrent(R.ctx) != CUDA_SUCCESS) {
+    if (g_cu.cuCtxSetCurrent(ca->owner->ctx) != CUDA_SUCCESS) {
         warnmsg("churn 线程无法绑定上下文");
         return NULL;
     }
     if (g_cu.cuStreamCreate(&s, 0) != CUDA_SUCCESS)
         return NULL;
     int idx = 0;
-    while (!g_stop) {
+    while (!g_stop && !ca->owner->churn_stop) {
         CUdeviceptr dst = (idx % 2 == 0) ? ca->a : ca->b;
         CUdeviceptr src = (idx % 2 == 0) ? ca->b : ca->a;
         if (g_cu.cuMemcpyDtoDAsync(dst, src, ca->n, s) != CUDA_SUCCESS) {
@@ -760,7 +791,8 @@ static void cleanup_all(void)
     if (R.closed)
         return;
     R.closed = 1;
-    g_stop = 1;
+    R.churn_stop = 1; /* 只停本卡的 churn 线程，别的卡的线程还在跑 */
+    int had_ctx = R.ctx != NULL;
     if (!g_driver_loaded)
         return;
 
@@ -800,7 +832,7 @@ static void cleanup_all(void)
         g_nvml.Shutdown();
         R.nvml_ok = 0;
     }
-    if (!g_cleanup_quiet)
+    if (!g_cleanup_quiet && had_ctx)
         logmsg("已释放显存与 CUDA 上下文");
 }
 
@@ -823,7 +855,8 @@ static void setup(const Args *a)
     CUresult rc = g_cu.cuInit(0);
     if (rc != CUDA_SUCCESS) {
         errmsg("cuInit 失败: %s", cu_err(rc));
-        exit(3);
+        R.failed = 1;
+        return;
     }
     int drv = 0;
     if (g_cu.cuDriverGetVersion(&drv) == CUDA_SUCCESS)
@@ -833,12 +866,14 @@ static void setup(const Args *a)
     rc = g_cu.cuDeviceGetCount(&count);
     if (rc != CUDA_SUCCESS || count <= 0) {
         errmsg("看不到任何 GPU 设备（cuDeviceGetCount=%d）", count);
-        exit(3);
+        R.failed = 1;
+        return;
     }
     logmsg("可见设备数: %d", count);
     if (a->device < 0 || a->device >= count) {
         errmsg("--device %d 超出范围（共 %d 张卡）", a->device, count);
-        exit(3);
+        R.failed = 1;
+        return;
     }
     CUdevice dev = 0;
     g_cu.cuDeviceGet(&dev, a->device);
@@ -860,14 +895,16 @@ static void setup(const Args *a)
     rc = g_cu.cuCtxCreate(&R.ctx, 0, dev);
     if (rc != CUDA_SUCCESS) {
         errmsg("cuCtxCreate 失败: %s", cu_err(rc));
-        exit(3);
+        R.failed = 1;
+        return;
     }
 
     size_t free_ = 0, total = 0;
     rc = g_cu.cuMemGetInfo(&free_, &total);
     if (rc != CUDA_SUCCESS) {
         errmsg("cuMemGetInfo 失败: %s", cu_err(rc));
-        exit(3);
+        R.failed = 1;
+        return;
     }
     char b1[32], b2[32];
     logmsg("显存: 总 %s / 空闲 %s", human(b1, sizeof b1, total), human(b2, sizeof b2, free_));
@@ -884,7 +921,8 @@ static void setup(const Args *a)
     if (want < 64u * MB) {
         errmsg("可占显存太少（空闲 %s），检查是否有别的进程占着",
                human(b1, sizeof b1, free_));
-        exit(3);
+        R.failed = 1;
+        return;
     }
     logmsg("计划占用: %s（%.0f%% 空闲显存）", human(b1, sizeof b1, want),
            free_ ? 100.0 * (double)want / (double)free_ : 0.0);
@@ -892,7 +930,8 @@ static void setup(const Args *a)
     rc = g_cu.cuStreamCreate(&R.streams[0], 0);
     if (rc != CUDA_SUCCESS) {
         errmsg("创建 stream 失败: %s", cu_err(rc));
-        exit(3);
+        R.failed = 1;
+        return;
     }
     R.nstreams = 1;
 
@@ -902,20 +941,26 @@ static void setup(const Args *a)
     rc = g_cu.cuMemAlloc(&R.sink, R.sink_bytes);
     if (rc != CUDA_SUCCESS) {
         errmsg("无法分配 kernel 输出缓冲: %s", cu_err(rc));
-        exit(3);
+        R.failed = 1;
+        return;
     }
 
     double t0 = now_s();
     alloc_vram(want);
     if (R.got == 0) {
         errmsg("显存分配失败，一块都没拿到");
-        exit(3);
+        R.failed = 1;
+        return;
     }
     touch_vram();
+    if (R.failed)
+        return;
     logmsg("显存就绪: %s，耗时 %.1fs", human(b1, sizeof b1, R.got), now_s() - t0);
 
-    if (!load_kernel())
-        exit(3);
+    if (!load_kernel()) {
+        R.failed = 1;
+        return;
+    }
 
     R.block = a->threads;
     if (R.block > R.max_threads)
@@ -931,6 +976,8 @@ static void setup(const Args *a)
         R.iters = (uint32_t)a->iters_opt;
     else
         R.iters = calibrate(a->target_ms);
+    if (R.failed)
+        return;
     logmsg("发射配置: grid=%d  block=%d  streams=%d  iters=%u", R.grid, R.block, a->streams,
            R.iters);
 
@@ -938,7 +985,8 @@ static void setup(const Args *a)
         rc = g_cu.cuStreamCreate(&R.streams[i], 0);
         if (rc != CUDA_SUCCESS) {
             errmsg("创建 stream 失败: %s", cu_err(rc));
-            exit(3);
+            R.failed = 1;
+            return;
         }
         R.nstreams = i + 1;
     }
@@ -982,6 +1030,7 @@ static void setup(const Args *a)
             arg->a = ca->ptr;
             arg->b = cb->ptr;
             arg->n = n;
+            arg->owner = &R;
             logmsg("显存带宽 churn 已启动（每轮 %s）", human(b1, sizeof b1, n));
             if (pthread_create(&R.churn_tid, NULL, churn_main, arg) == 0)
                 R.churn_started = 1;
@@ -1003,7 +1052,8 @@ static void run_loop(const Args *a)
                     break;
                 cuda_fail("kernel 发射失败", rc);
                 cleanup_all();
-                exit(3);
+                R.failed = 1;
+                return;
             }
             R.launches++;
             R.inflight[i]++;
@@ -1014,7 +1064,8 @@ static void run_loop(const Args *a)
                 if (rc != CUDA_SUCCESS && !g_stop) {
                     cuda_fail("kernel 执行失败", rc);
                     cleanup_all();
-                    exit(3);
+                    R.failed = 1;
+                    return;
                 }
                 R.inflight[i] = 0;
             }
@@ -1205,8 +1256,10 @@ static void self_check(const Args *a)
     g_cu.cuStreamSynchronize(R.streams[0]);
     logmsg("分配 + 写入 256MiB 测试显存: OK");
 
-    if (!load_kernel())
-        exit(3);
+    if (!load_kernel()) {
+        R.failed = 1;
+        return;
+    }
 
     R.block = a->threads;
     if (R.block > R.max_threads)
@@ -1305,92 +1358,81 @@ static int resolve_devices(Args *a, int count)
 }
 
 /* ------------------------------------------------------------------------- */
-/* 多卡：每张卡 fork 一个子进程                                               */
+/* 多卡：一个进程，每张卡一个线程                                             */
 /*                                                                            */
-/* 一个进程里多个 CUDA 上下文要来回切 current context，容易出错，而且一张卡挂   */
-/* 了会连坐。所以每张卡一个子进程：各自建上下文、各自刷、各自释放。            */
-/* 父进程只负责转发信号和回收子进程，自己不碰 CUDA 上下文，所以它被杀也不会     */
-/* 留下占着显存的孤儿（子进程都设了 PR_SET_PDEATHSIG）。                       */
+/* 不在 fork 出来的子进程里建上下文：有些池化平台按进程分配 GPU 会话，子进程     */
+/* 继承不了父进程的会话，重新申请就失败（bootstrap: Fail to init session）。     */
+/* 所以走单进程多线程：一个进程一个会话，每张卡一个线程，各自建上下文、各自刷、   */
+/* 各自释放。                                                                  */
+/* 收尾也天然干净：进程一退（哪怕 kill -9）所有卡的显存都由驱动回收，不会留孤儿  */
+/* 进程；收到 SIGINT/SIGTERM 时每个线程都走正常释放流程。                       */
 /* ------------------------------------------------------------------------- */
 
-static pid_t g_kids[MAX_DEVICES];
-static int g_nkids;
+typedef struct {
+    const Args *a;
+    int dev;
+    int code;
+} Worker;
 
-static void on_forward(int sig)
+static void *worker_main(void *p)
 {
-    for (int i = 0; i < g_nkids; i++)
-        if (g_kids[i] > 0)
-            kill(g_kids[i], sig);
-    g_stop = 1;
+    Worker *w = (Worker *)p;
+    Args a = *w->a; /* 每张卡一份自己的参数副本，改 device 不互相踩 */
+    a.device = w->dev;
+    if (w->a->ndevs > 1)
+        g_dev_tag = w->dev; /* 多卡时日志带卡号，单卡保持原样 */
+
+    if (w->a->diag) {
+        diag(&a);
+        w->code = 0;
+        return NULL;
+    }
+    if (w->a->check) {
+        self_check(&a);
+        w->code = 0;
+        return NULL;
+    }
+    setup(&a);
+    if (!R.failed)
+        run_loop(&a);
+    cleanup_all();
+    w->code = R.failed ? 3 : 0;
+    return NULL;
 }
 
 static int run_multi(Args *a)
 {
-    struct sigaction sa;
-    memset(&sa, 0, sizeof sa);
-    sa.sa_handler = on_forward;
-    sigaction(SIGINT, &sa, NULL);
-    sigaction(SIGTERM, &sa, NULL);
-    sigaction(SIGHUP, &sa, NULL);
+    logmsg("多卡模式: 目标卡 %d 张，每张卡一个线程（单进程，只有一个 CUDA 会话）", a->ndevs);
 
-    logmsg("多卡模式: 目标卡 %d 张，每张卡一个子进程", a->ndevs);
+    Worker ws[MAX_DEVICES];
+    pthread_t tids[MAX_DEVICES];
+    int n = 0;
     for (int i = 0; i < a->ndevs; i++) {
-        int dev = a->devs[i];
-        fflush(NULL);
-        pid_t pid = fork();
-        if (pid < 0) {
-            errmsg("fork 失败: %s", strerror(errno));
-            break;
+        Worker *w = &ws[n];
+        w->a = a;
+        w->dev = a->devs[i];
+        w->code = 3;
+        if (pthread_create(&tids[n], NULL, worker_main, w) == 0) {
+            n++;
+        } else {
+            errmsg("#%d 线程起不来，这张卡跳过", a->devs[i]);
         }
-        if (pid == 0) {
-            /* 父进程不管怎么没的（包括 kill -9），子进程都收到 SIGTERM 走正常释放流程 */
-            prctl(PR_SET_PDEATHSIG, SIGTERM);
-            if (getppid() == 1) /* fork 到 prctl 之间父进程已经没了 */
-                _exit(0);
-            /* 子进程不转发、只管自己 */
-            g_nkids = 0;
-            struct sigaction cs;
-            memset(&cs, 0, sizeof cs);
-            cs.sa_handler = on_signal;
-            sigaction(SIGINT, &cs, NULL);
-            sigaction(SIGTERM, &cs, NULL);
-            sigaction(SIGHUP, &cs, NULL);
-
-            g_dev_tag = dev;
-            a->device = dev;
-            if (a->diag) {
-                diag(a);
-                _exit(0);
-            }
-            if (a->check) {
-                self_check(a);
-                _exit(0);
-            }
-            setup(a);
-            run_loop(a);
-            cleanup_all();
-            fflush(NULL);
-            _exit(0);
-        }
-        g_kids[g_nkids++] = pid;
     }
 
-    int worst = 0;
-    int left = g_nkids;
-    while (left > 0) {
-        int st = 0;
-        pid_t p = waitpid(-1, &st, 0);
-        if (p < 0) {
-            if (errno == EINTR)
-                continue;
-            break;
-        }
-        left--;
-        int code = WIFEXITED(st) ? WEXITSTATUS(st) : 3;
-        if (code > worst)
-            worst = code;
+    for (int i = 0; i < n; i++)
+        pthread_join(tids[i], NULL);
+
+    int worst = 0, bad = 0;
+    for (int i = 0; i < n; i++) {
+        if (ws[i].code != 0)
+            bad++;
+        if (ws[i].code > worst)
+            worst = ws[i].code;
     }
-    logmsg("全部 %d 个子进程已退出（显存都已释放）", g_nkids);
+    if (worst == 0)
+        logmsg("全部 %d 张卡已收工，显存都已释放", n);
+    else
+        errmsg("%d 张卡里有 %d 张没能正常刷（错误见上面带卡号的行）", n, bad);
     return worst;
 }
 
@@ -1546,6 +1588,21 @@ int main(int argc, char **argv)
     }
     if (resolve_devices(&a, devcount) != 0)
         return 3;
+
+    /* --diag / --check 本来就是一张卡一张卡看，串行跑，不用起线程 */
+    if (a.ndevs > 1 && (a.diag || a.check)) {
+        for (int i = 0; i < a.ndevs; i++) {
+            a.device = a.devs[i];
+            g_dev_tag = a.devs[i];
+            if (a.diag)
+                diag(&a);
+            else
+                self_check(&a);
+            memset(&R, 0, sizeof R); /* 下一张卡从干净状态开始 */
+            memset(&g_nvml, 0, sizeof g_nvml);
+        }
+        return 0;
+    }
     if (a.ndevs > 1)
         return run_multi(&a);
     a.device = a.devs[0];
@@ -1559,7 +1616,8 @@ int main(int argc, char **argv)
         return 0;
     }
     setup(&a);
-    run_loop(&a);
+    if (!R.failed)
+        run_loop(&a);
     cleanup_all();
-    return 0;
+    return R.failed ? 3 : 0;
 }

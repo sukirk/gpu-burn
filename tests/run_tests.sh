@@ -160,6 +160,7 @@ pids_matching() {
 }
 
 # multi_suite <标签> <可执行命令...>；命令行子串用于查残留进程
+# 多卡现在是「一个进程 + 每卡一个线程」：不带子进程，所以 kill -9 也不会留孤儿。
 multi_suite() {
     local label="$1"
     shift
@@ -175,7 +176,7 @@ multi_suite() {
         "${cmd[@]}" --devices 0,1 --duration 2 --stats 1 --target-ms 40 >"$out" 2>&1
     code=$?
     if [ "$code" -eq 0 ] && grep -q "#0" "$out" && grep -q "#1" "$out" \
-        && grep -q "全部 2 个子进程已退出" "$out"; then
+        && grep -q "全部 2 张卡已收工" "$out"; then
         ok "$label --devices 0,1 两张卡各刷各的"
     else
         bad "$label --devices 0,1（退出码 $code）"
@@ -186,7 +187,7 @@ multi_suite() {
     LD_LIBRARY_PATH="$MOCK" MOCK_DEVS=3 MOCK_LOG="$LOG" \
         "${cmd[@]}" --devices all --duration 1 --stats 0 --target-ms 40 >"$out" 2>&1
     code=$?
-    if [ "$code" -eq 0 ] && grep -q "全部 3 个子进程已退出" "$out"; then
+    if [ "$code" -eq 0 ] && grep -q "全部 3 张卡已收工" "$out"; then
         ok "$label --devices all 展开成 3 张卡"
     else
         bad "$label --devices all（退出码 $code）"
@@ -203,7 +204,35 @@ multi_suite() {
         tail -5 "$out"
     fi
 
-    # SIGTERM：父进程收到后转给所有子进程，每个都走正常释放流程
+    # 一个进程刷多卡：跑起来的时候只能有一个进程，不能 fork 出一堆子进程
+    out="$TMP/${label}_oneproc.txt"
+    LD_LIBRARY_PATH="$MOCK" MOCK_DEVS=3 "${cmd[@]}" --devices all --stats 0 --target-ms 40 >"$out" 2>&1 &
+    pid=$!
+    sleep 3
+    npids=$(pids_matching "$pattern" | wc -l)
+    kill -TERM "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+    if [ "$npids" -eq 1 ]; then
+        ok "$label 多卡只起一个进程（没有子进程）"
+    else
+        bad "$label 多卡进程数（期望 1，实际 $npids）"
+        tail -5 "$out"
+    fi
+
+    # 某张卡失败不能连累别的卡：模拟 1 号卡建上下文失败
+    out="$TMP/${label}_partial.txt"
+    LD_LIBRARY_PATH="$MOCK" MOCK_DEVS=3 MOCK_FAIL_CTX_DEV=1 \
+        "${cmd[@]}" --devices 0,1,2 --duration 2 --stats 0 --target-ms 40 >"$out" 2>&1
+    code=$?
+    released=$(grep -c "已释放显存与 CUDA 上下文" "$out")
+    if [ "$code" -eq 3 ] && [ "$released" -ge 2 ] && grep -q "没能正常刷" "$out"; then
+        ok "$label 一张卡失败时其余卡照常刷完（释放 $released 张）"
+    else
+        bad "$label 单卡失败隔离（退出码 $code，释放 $released）"
+        tail -10 "$out"
+    fi
+
+    # SIGTERM：主线程收到后让所有卡都走正常释放流程
     out="$TMP/${label}_multisig.txt"
     LD_LIBRARY_PATH="$MOCK" MOCK_DEVS=2 "${cmd[@]}" --devices all --stats 0 --target-ms 40 >"$out" 2>&1 &
     pid=$!
@@ -220,7 +249,7 @@ multi_suite() {
         tail -8 "$out"
     fi
 
-    # SIGKILL 父进程：靠 PR_SET_PDEATHSIG 让子进程自己收工，不能留下占显存的孤儿
+    # SIGKILL：单进程设计，进程一死显存就由驱动回收，不会留下占显存的孤儿进程
     out="$TMP/${label}_multikill.txt"
     LD_LIBRARY_PATH="$MOCK" MOCK_DEVS=2 "${cmd[@]}" --devices all --stats 0 --target-ms 40 >"$out" 2>&1 &
     pid=$!
@@ -231,12 +260,11 @@ multi_suite() {
         [ -z "$(pids_matching "$pattern")" ] && break
         sleep 1
     done
-    released=$(grep -c "已释放显存与 CUDA 上下文" "$out")
-    if [ "$released" -ge 2 ] && [ -z "$(pids_matching "$pattern")" ]; then
-        ok "$label 父进程被 kill -9 后子进程仍自行释放（无孤儿）"
+    if [ -z "$(pids_matching "$pattern")" ]; then
+        ok "$label 被 kill -9 后没有残留进程（单进程，不会有孤儿）"
     else
-        bad "$label 父进程 kill -9 后的收尾（释放 $released 个）"
-        tail -8 "$out"
+        bad "$label kill -9 后仍有残留进程"
+        pids_matching "$pattern"
     fi
 }
 

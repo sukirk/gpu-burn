@@ -25,7 +25,7 @@ import time
 from ctypes import (POINTER, Structure, byref, c_char_p, c_float, c_int,
                     c_size_t, c_uint, c_uint32, c_uint64, c_void_p)
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 MAX_DEVICES = 32  # --devices all 最多展开这么多张，防手滑
 
 CUDA_SUCCESS = 0
@@ -567,10 +567,11 @@ def calibrate(cu, fn, grid, block, stream, out_ptr, target_ms, log):
 # --------------------------------------------------------------------------- #
 
 class Burner(object):
-    def __init__(self, args, log):
+    def __init__(self, args, log, stop_event=None):
         self.args = args
         self.log = log
-        self.stop = threading.Event()
+        # 多卡模式下所有线程共用一个停止事件，主线程收到信号就把它 set 掉
+        self.stop = stop_event if stop_event is not None else threading.Event()
         self.stop_signal = None
         self.cu = None
         self.nvml = None
@@ -784,6 +785,7 @@ class Burner(object):
         cu = self.cu
         if cu is None:
             return
+        had_ctx = self.ctx is not None
         self.stop.set()
         if self.churn_thread is not None:
             self.churn_thread.join(timeout=5.0)
@@ -814,7 +816,8 @@ class Burner(object):
         if self.nvml:
             self.nvml.shutdown()
             self.nvml = None
-        self.log("已释放显存与 CUDA 上下文")
+        if had_ctx:  # 上下文都没建起来就没什么好释放的，别打这句误导人
+            self.log("已释放显存与 CUDA 上下文")
 
 
 def build_parser():
@@ -903,9 +906,9 @@ def resolve_devices(spec, count):
     return out
 
 
-def _run_one(args, log):
-    """单卡流程：建上下文、刷、收尾。多卡模式下每个子进程跑一份。"""
-    burner = Burner(args, log)
+def _run_one(args, log, stop_event=None, install_signal=True):
+    """单卡流程：建上下文、刷、收尾。多卡模式下每个线程跑一份。"""
+    burner = Burner(args, log, stop_event)
     old_handlers = {}
 
     def install_signals():
@@ -923,7 +926,8 @@ def _run_one(args, log):
             except (ValueError, OSError):
                 pass
 
-    install_signals()
+    if install_signal:  # 信号只能装在主线程；多卡时由 _run_multi 统一装
+        install_signals()
     code = 0
     try:
         log("gpu_burn %s，pid %d" % (VERSION, os.getpid()))
@@ -951,68 +955,54 @@ def _run_one(args, log):
     return code
 
 
-def _set_parent_death_signal():
-    """父进程不管怎么没的（包括 kill -9），本进程都收到 SIGTERM，不会变成占显存的孤儿。"""
-    try:
-        libc = ctypes.CDLL(None, use_errno=True)
-        libc.prctl(1, signal.SIGTERM, 0, 0, 0)  # PR_SET_PDEATHSIG = 1
-    except Exception:  # 非 Linux 或没有 prctl：至少下面那句还能兜住
-        pass
-    if os.getppid() == 1:  # fork 到 prctl 之间父进程已经没了
-        sys.stdout.flush()
-        os._exit(0)
-
-
 def _run_multi(args, devices, log):
-    """多卡：每张卡一个子进程。父进程只转发信号、回收子进程，自己不碰 CUDA 上下文。"""
-    kids = []
+    """多卡：一个进程，每张卡一个线程。
 
-    def forward(sig, _frame):
-        for pid in kids:
-            try:
-                os.kill(pid, sig)
-            except OSError:
-                pass
+    不在 fork 出来的子进程里建上下文：有些池化平台按进程分配 GPU 会话，子进程
+    继承不了父进程的会话，重新申请就失败（bootstrap: Fail to init session）。
+    单进程只建立一个会话，每张卡一个线程各建上下文、各自刷、各自释放。
 
+    收尾也天然干净：进程一退（哪怕 kill -9）所有卡的显存都由驱动回收，不会留下
+    占着显存的孤儿进程；收到 SIGINT/SIGTERM 时每个线程都走正常释放流程。
+    """
+    log("多卡模式: 目标卡 %d 张，每张卡一个线程（单进程，只有一个 CUDA 会话）" % len(devices))
+    stop = threading.Event()
     saved = {}
+
+    def on_sig(_sig, _frame):
+        stop.set()
+
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         saved[sig] = signal.getsignal(sig)
-        signal.signal(sig, forward)
+        signal.signal(sig, on_sig)
 
-    log("多卡模式: 目标卡 %d 张，每张卡一个子进程" % len(devices))
-    for dev in devices:
-        sys.stdout.flush()
-        sys.stderr.flush()
-        pid = os.fork()
-        if pid == 0:
-            _set_parent_death_signal()
-            child_args = argparse.Namespace(**vars(args))
-            child_args.device = dev
-            code = 3
-            try:
-                code = _run_one(child_args, _make_log(args.quiet, dev))
-            except BaseException:
-                code = 3
-            sys.stdout.flush()
-            sys.stderr.flush()
-            os._exit(code)
-        kids.append(pid)
+    results = [3] * len(devices)
 
-    worst = 0
-    while kids:
+    def work(i, dev):
+        child_args = argparse.Namespace(**vars(args))
+        child_args.device = dev
         try:
-            pid, status = os.waitpid(-1, 0)
-        except ChildProcessError:
-            break
-        if pid in kids:
-            kids.remove(pid)
-        code = os.WEXITSTATUS(status) if os.WIFEXITED(status) else 3
-        if code > worst:
-            worst = code
+            results[i] = _run_one(child_args, _make_log(args.quiet, dev), stop, False)
+        except BaseException:  # 一张卡出意外不能拖垮别的卡
+            results[i] = 3
+
+    threads = []
+    for i, dev in enumerate(devices):
+        t = threading.Thread(target=work, args=(i, dev), name="gpu%d" % dev)
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join()
 
     for sig, handler in saved.items():
         signal.signal(sig, handler)
-    log("全部 %d 个子进程已退出（显存都已释放）" % len(devices))
+
+    worst = max(results) if results else 0
+    bad = sum(1 for c in results if c)
+    if worst == 0:
+        log("全部 %d 张卡已收工，显存都已释放" % len(devices))
+    else:
+        log("ERR: %d 张卡里有 %d 张没能正常刷（错误见上面带卡号的行）" % (len(devices), bad))
     return worst
 
 

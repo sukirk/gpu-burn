@@ -16,6 +16,7 @@
  */
 
 #define _GNU_SOURCE
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -49,8 +50,11 @@ typedef uint64_t CUdeviceptr;
 #define MAX_STREAM 64
 
 static int g_inited;
+static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;  /* 多线程调用驱动 */
+static pthread_mutex_t g_log_lock = PTHREAD_MUTEX_INITIALIZER;
+static __thread int t_dev;                                   /* 本线程当前设备 */
 static size_t g_total = 80ull << 30;
-static size_t g_used;
+static size_t g_used_dev[64];                                /* 每张卡各自的占用 */
 static int g_sms = 108;
 static int g_devs = 1;               /* MOCK_DEVS：假装机器上有几张卡 */
 static const char *g_name = "Mock A100-SXM4-80GB";
@@ -59,10 +63,11 @@ static size_t g_oom_after = 0;       /* 非 0：used 超过它之后一律 OOM *
 static int g_fail_launch_at = 0;     /* 非 0：第 N 次 cuLaunchKernel 注入错误 */
 static int g_fail_code = 999;        /* 注入的错误码（999 = CUDA_ERROR_UNKNOWN） */
 static int g_launch_calls = 0;
+static int g_fail_ctx_dev = -1;      /* MOCK_FAIL_CTX_DEV：让指定卡建上下文失败 */
 static int g_sticky = 0;             /* 注入后模拟上下文丢失：后续调用也跟着失败 */
 static FILE *g_log;
 
-typedef struct { CUdeviceptr ptr; size_t size; int used; } alloc_t;
+typedef struct { CUdeviceptr ptr; size_t size; int used; int dev; } alloc_t;
 static alloc_t g_allocs[MAX_ALLOC];
 
 typedef struct {
@@ -75,10 +80,11 @@ typedef struct {
     double t;
 } mock_event_t;
 
-typedef struct { unsigned magic; } mock_ctx_t;
+typedef struct { unsigned magic; int dev; } mock_ctx_t;
 
-static mock_stream_t *g_streams[MAX_STREAM];
-static int g_nstreams;
+/* stream 归线程所有：每张卡一个线程，各自建各自的 stream */
+static __thread mock_stream_t *t_streams[MAX_STREAM];
+static __thread int t_nstreams;
 
 /* ------------------------------------------------------------------ */
 
@@ -104,21 +110,24 @@ static void sleep_until(double t)
 
 static void vlog(const char *fmt, ...)
 {
+    char buf[1024];
     va_list ap;
     va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    if (n < 0)
+        return;
+    pthread_mutex_lock(&g_log_lock);
     if (g_log) {
-        vfprintf(g_log, fmt, ap);
+        fwrite(buf, 1, (size_t)n, g_log);
         fputc('\n', g_log);
         fflush(g_log);
     }
-    va_end(ap);
+    pthread_mutex_unlock(&g_log_lock);
 }
 
-static void env_init(void)
+static void env_init_locked(void)
 {
-    if (g_inited)
-        return;
-    g_inited = 1;
     const char *s;
     if ((s = getenv("MOCK_TOTAL_GB")))
         g_total = (size_t)(atof(s) * (double)(1ull << 30));
@@ -135,15 +144,34 @@ static void env_init(void)
         g_speed = atof(s);
     if ((s = getenv("MOCK_OOM_AFTER_GB")))
         g_oom_after = (size_t)(atof(s) * (double)(1ull << 30));
-    if ((s = getenv("MOCK_USED_GB")))     /* 模拟「被别的进程占掉」的显存 */
-        g_used = (size_t)(atof(s) * (double)(1ull << 30));
+    if ((s = getenv("MOCK_USED_GB"))) {   /* 模拟「被别的进程占掉」的显存，每张卡都占 */
+        size_t used = (size_t)(atof(s) * (double)(1ull << 30));
+        for (int i = 0; i < 64; i++)
+            g_used_dev[i] = used;
+    }
     if ((s = getenv("MOCK_FAIL_LAUNCH_AT")))
         g_fail_launch_at = atoi(s);
     if ((s = getenv("MOCK_FAIL_CODE")))
         g_fail_code = atoi(s);
+    if ((s = getenv("MOCK_FAIL_CTX_DEV")))
+        g_fail_ctx_dev = atoi(s);
     if ((s = getenv("MOCK_LOG")))
         g_log = fopen(s, "a");
-    vlog("mock: init total=%zu sms=%d devs=%d name=%s", g_total, g_sms, g_devs, g_name);
+}
+
+static void env_init(void)
+{
+    if (g_inited)
+        return;
+    pthread_mutex_lock(&g_lock);
+    if (!g_inited) {
+        env_init_locked();
+        g_inited = 1;
+        pthread_mutex_unlock(&g_lock);
+        vlog("mock: init total=%zu sms=%d devs=%d name=%s", g_total, g_sms, g_devs, g_name);
+        return;
+    }
+    pthread_mutex_unlock(&g_lock);
 }
 
 static alloc_t *find_alloc(CUdeviceptr ptr, size_t size)
@@ -261,8 +289,14 @@ CUresult cuCtxCreate_v2(CUcontext *ctx, unsigned int flags, CUdevice dev)
     (void)dev;
     if (!ctx)
         return E_INVALID_VALUE;
+    if ((int)dev == g_fail_ctx_dev) {
+        vlog("mock: cuCtxCreate(dev=%d) -> 注入失败 %d", (int)dev, g_fail_code);
+        return (CUresult)g_fail_code;
+    }
     mock_ctx_t *c = (mock_ctx_t *)calloc(1, sizeof(*c));
     c->magic = MAGIC_CTX;
+    c->dev = (int)dev;
+    t_dev = (int)dev;
     *ctx = c;
     vlog("mock: cuCtxCreate -> %p", (void *)c);
     return OK;
@@ -284,6 +318,7 @@ CUresult cuCtxSetCurrent(CUcontext ctx)
     mock_ctx_t *c = (mock_ctx_t *)ctx;
     if (!c || c->magic != MAGIC_CTX)
         return E_INVALID_CONTEXT;
+    t_dev = c->dev;
     return OK;
 }
 
@@ -292,9 +327,9 @@ CUresult cuCtxSynchronize(void)
     if (g_sticky)
         return g_sticky;
     double t = 0;
-    for (int i = 0; i < g_nstreams; i++)
-        if (g_streams[i]->busy_until > t)
-            t = g_streams[i]->busy_until;
+    for (int i = 0; i < t_nstreams; i++)
+        if (t_streams[i]->busy_until > t)
+            t = t_streams[i]->busy_until;
     note_sleep(t - now_s());
     sleep_until(t);
     vlog("mock: cuCtxSynchronize");
@@ -304,7 +339,7 @@ CUresult cuCtxSynchronize(void)
 CUresult cuMemGetInfo_v2(size_t *free_, size_t *total)
 {
     if (free_)
-        *free_ = g_total - g_used;
+        *free_ = g_total - g_used_dev[t_dev];
     if (total)
         *total = g_total;
     return OK;
@@ -319,8 +354,11 @@ CUresult cuMemAlloc_v2(CUdeviceptr *ptr, size_t size)
     size_t cap = g_total;
     if (g_oom_after && cap > g_oom_after)
         cap = g_oom_after;
-    if (g_used + size > cap) {
-        vlog("mock: cuMemAlloc(%zu) -> OUT_OF_MEMORY (used=%zu)", size, g_used);
+    size_t *used = &g_used_dev[t_dev];
+    pthread_mutex_lock(&g_lock);
+    if (*used + size > cap) {
+        vlog("mock: cuMemAlloc(%zu) -> OUT_OF_MEMORY (dev=%d used=%zu)", size, t_dev, *used);
+        pthread_mutex_unlock(&g_lock);
         return E_OUT_OF_MEMORY;
     }
     for (int i = 0; i < MAX_ALLOC; i++) {
@@ -328,13 +366,16 @@ CUresult cuMemAlloc_v2(CUdeviceptr *ptr, size_t size)
             continue;
         g_allocs[i].used = 1;
         g_allocs[i].size = size;
+        g_allocs[i].dev = t_dev;
         g_allocs[i].ptr = 0x7f0000000000ull + (uint64_t)i * 0x100000000ull;
-        g_used += size;
+        *used += size;
         *ptr = g_allocs[i].ptr;
-        vlog("mock: cuMemAlloc(%zu) -> [%d] 0x%llx used=%zu", size, i,
-             (unsigned long long)*ptr, g_used);
+        pthread_mutex_unlock(&g_lock);
+        vlog("mock: cuMemAlloc(%zu) -> [%d] 0x%llx dev=%d used=%zu", size, i,
+             (unsigned long long)*ptr, t_dev, *used);
         return OK;
     }
+    pthread_mutex_unlock(&g_lock);
     return E_OUT_OF_MEMORY;
 }
 
@@ -343,9 +384,13 @@ CUresult cuMemFree_v2(CUdeviceptr ptr)
     alloc_t *a = find_alloc(ptr, 0);
     if (!a || a->ptr != ptr)
         return E_INVALID_VALUE;
-    g_used -= a->size;
+    pthread_mutex_lock(&g_lock);
+    g_used_dev[a->dev] -= a->size;
+    size_t left = g_used_dev[a->dev];
+    int dev = a->dev;
     a->used = 0;
-    vlog("mock: cuMemFree(0x%llx) used=%zu", (unsigned long long)ptr, g_used);
+    pthread_mutex_unlock(&g_lock);
+    vlog("mock: cuMemFree(0x%llx) dev=%d used=%zu", (unsigned long long)ptr, dev, left);
     return OK;
 }
 
@@ -467,8 +512,8 @@ CUresult cuStreamCreate(CUstream *stream, unsigned int flags)
         return E_INVALID_VALUE;
     mock_stream_t *m = (mock_stream_t *)calloc(1, sizeof(*m));
     m->magic = MAGIC_STREAM;
-    if (g_nstreams < MAX_STREAM)
-        g_streams[g_nstreams++] = m;
+    if (t_nstreams < MAX_STREAM)
+        t_streams[t_nstreams++] = m;
     *stream = m;
     return OK;
 }
@@ -478,9 +523,9 @@ CUresult cuStreamDestroy_v2(CUstream s)
     mock_stream_t *m = as_stream(s);
     if (!m)
         return E_INVALID_HANDLE;
-    for (int i = 0; i < g_nstreams; i++)
-        if (g_streams[i] == m)
-            g_streams[i] = g_streams[--g_nstreams];
+    for (int i = 0; i < t_nstreams; i++)
+        if (t_streams[i] == m)
+            t_streams[i] = t_streams[--t_nstreams];
     m->magic = 0;
     free(m);
     return OK;
