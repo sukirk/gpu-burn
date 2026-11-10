@@ -28,10 +28,15 @@ $(BIN): $(SRC)
 
 mocks: $(MOCK)/libcuda.so.1 $(MOCK)/libnvidia-ml.so.1
 
-$(MOCK)/libcuda.so.1: tests/mock_libcuda.c | $(MOCK)
+# 假驱动是 .gitignore 里的产物：从别的机器/容器拷过来的副本可能要求更高的 glibc，
+# 而它比源码新时 make 不会重编，测试就会莫名其妙 dlopen 失败。所以每次都重编（不到 1 秒）。
+FORCE:
+.PHONY: FORCE
+
+$(MOCK)/libcuda.so.1: tests/mock_libcuda.c FORCE | $(MOCK)
 	$(CC) -O2 -Wall -Wextra -fPIC -shared -Wl,-soname,libcuda.so.1 -o $@ $<
 
-$(MOCK)/libnvidia-ml.so.1: tests/mock_nvml.c | $(MOCK)
+$(MOCK)/libnvidia-ml.so.1: tests/mock_nvml.c FORCE | $(MOCK)
 	$(CC) -O2 -Wall -Wextra -fPIC -shared -Wl,-soname,libnvidia-ml.so.1 -o $@ $<
 
 $(MOCK):

@@ -22,7 +22,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define VERSION "1.1.1"
+#define VERSION "1.2.0"
 
 /* ------------------------------------------------------------------------- */
 /* CUDA Driver API 的最小类型/常量定义（避免依赖 cuda.h）                      */
@@ -54,9 +54,11 @@ typedef uint64_t CUdeviceptr;
 /* ------------------------------------------------------------------------- */
 
 /*
- * 每个线程做一个固定次数的循环，循环体是 4 条互相独立的 FP32 FMA（加一个递减
- * 计数器和分支）。选 4 条独立 FMA 是为了让每个 SM 的 4 个 warp 调度器都能被占满：
- * 每轮 7 条指令里 4 条是 FMA，正好卡在 FP32 吞吐上，既不空转也不被整数指令拖走。
+ * 每个线程做 iters 轮循环，每轮 64 条互相独立的 FP32 FMA（8 个累加器 × 8 次展开），
+ * 另加 1 条计数器递减和 1 个分支。指令流里 64/67 是 FMA，远高于打满 FP32 流水线所需的
+ * 50%（每个 SM 每周期 4 个发射槽，最多 2 个能是 FFMA），所以瓶颈落在浮点吞吐而不是循环
+ * 开销上。8 个累加器让同一累加器相邻两次 FMA 相隔 8 条指令，覆盖 FFMA 的 4 周期延迟，
+ * 不会出现依赖停顿。
  * 累加器用 a = 0.5*a + seed 的形式，保证数值有界（不会 Inf/NaN），同时因为系数和
  * seed 都来自寄存器，ptxas 无法把它折叠掉。循环结束每线程写一次全局内存，
  * 防止整个循环被当成死代码删掉。
@@ -69,7 +71,7 @@ typedef uint64_t CUdeviceptr;
     "// program needs no CUDA toolkit, no nvcc and no per-architecture cubin.\n" \
     "//\n"                                                               \
     "//   params: (u64 out_ptr, u32 iters)\n"                            \
-    "//   each thread: iters * 4 FMA on 4 independent accumulators, then one store so\n" \
+    "//   each thread: iters * 64 FMA (8 accumulators x 8 unrolled) then one store so\n" \
     "//   ptxas cannot prove the loop dead.\n"                           \
     "//\n"
 
@@ -80,39 +82,110 @@ typedef uint64_t CUdeviceptr;
     ")\n{\n"
 
 #define KERNEL_BODY                                                      \
-    "\n"                                                                 \
-    "    .reg .pred  %p1;\n"                                             \
-    "    .reg .b32   %r1, %r2;\n"                                        \
-    "    .reg .b64   %rd1, %rd2;\n"                                      \
-    "    .reg .f32   %f1, %f2, %f3, %f4, %f5, %f6;\n"                    \
-    "\n"                                                                 \
-    "    ld.param.u64    %rd1, [out_ptr];\n"                             \
-    "    ld.param.u32    %r1,  [iters];\n"                               \
-    "\n"                                                                 \
-    "    mov.u32         %r2, %tid.x;\n"                                 \
-    "    cvt.rn.f32.u32  %f5, %r2;           // per-thread seed\n"         \
-    "    mov.f32         %f1, 0f3F800000;    // 1.0\n"                   \
-    "    mov.f32         %f2, 0f3F800000;\n"                             \
-    "    mov.f32         %f3, 0f3F800000;\n"                             \
-    "    mov.f32         %f4, 0f3F800000;\n"                             \
-    "    mov.f32         %f6, 0f3F000000;    // 0.5\n"                   \
-    "\n"                                                                 \
-    "LOOP:\n"                                                            \
-    "    fma.rn.f32      %f1, %f1, %f6, %f5;\n"                          \
-    "    fma.rn.f32      %f2, %f2, %f6, %f5;\n"                          \
-    "    fma.rn.f32      %f3, %f3, %f6, %f5;\n"                          \
-    "    fma.rn.f32      %f4, %f4, %f6, %f5;\n"                          \
-    "    add.u32         %r1, %r1, -1;\n"                                \
-    "    setp.gt.u32     %p1, %r1, 0;\n"                                 \
-    "    @%p1 bra        LOOP;\n"                                        \
-    "\n"                                                                 \
-    "    add.f32         %f1, %f1, %f2;\n"                               \
-    "    add.f32         %f3, %f3, %f4;\n"                               \
-    "    add.f32         %f1, %f1, %f3;\n"                               \
-    "\n"                                                                 \
-    "    mad.wide.u32    %rd2, %r2, 4, %rd1;\n"                          \
-    "    st.global.f32   [%rd2], %f1;\n"                                 \
+    "\n" \
+    "    .reg .pred  %p1;\n" \
+    "    .reg .b32   %r1, %r2;\n" \
+    "    .reg .b64   %rd1, %rd2;\n" \
+    "    .reg .f32   %f1, %f2, %f3, %f4, %f5, %f6, %f7, %f8, %f9, %f10;\n" \
+    "\n" \
+    "    ld.param.u64    %rd1, [out_ptr];\n" \
+    "    ld.param.u32    %r1,  [iters];\n" \
+    "\n" \
+    "    mov.u32         %r2, %tid.x;\n" \
+    "    cvt.rn.f32.u32  %f9, %r2;           // per-thread seed\n" \
+    "    mov.f32         %f10, 0f3F000000;   // 0.5\n" \
+    "    mov.f32         %f1, 0f3F800000;    // 1.0\n" \
+    "    mov.f32         %f2, 0f3F800000;    // 1.0\n" \
+    "    mov.f32         %f3, 0f3F800000;    // 1.0\n" \
+    "    mov.f32         %f4, 0f3F800000;    // 1.0\n" \
+    "    mov.f32         %f5, 0f3F800000;    // 1.0\n" \
+    "    mov.f32         %f6, 0f3F800000;    // 1.0\n" \
+    "    mov.f32         %f7, 0f3F800000;    // 1.0\n" \
+    "    mov.f32         %f8, 0f3F800000;    // 1.0\n" \
+    "\n" \
+    "LOOP:\n" \
+    "    fma.rn.f32      %f1, %f1, %f10, %f9;\n" \
+    "    fma.rn.f32      %f2, %f2, %f10, %f9;\n" \
+    "    fma.rn.f32      %f3, %f3, %f10, %f9;\n" \
+    "    fma.rn.f32      %f4, %f4, %f10, %f9;\n" \
+    "    fma.rn.f32      %f5, %f5, %f10, %f9;\n" \
+    "    fma.rn.f32      %f6, %f6, %f10, %f9;\n" \
+    "    fma.rn.f32      %f7, %f7, %f10, %f9;\n" \
+    "    fma.rn.f32      %f8, %f8, %f10, %f9;\n" \
+    "    fma.rn.f32      %f1, %f1, %f10, %f9;\n" \
+    "    fma.rn.f32      %f2, %f2, %f10, %f9;\n" \
+    "    fma.rn.f32      %f3, %f3, %f10, %f9;\n" \
+    "    fma.rn.f32      %f4, %f4, %f10, %f9;\n" \
+    "    fma.rn.f32      %f5, %f5, %f10, %f9;\n" \
+    "    fma.rn.f32      %f6, %f6, %f10, %f9;\n" \
+    "    fma.rn.f32      %f7, %f7, %f10, %f9;\n" \
+    "    fma.rn.f32      %f8, %f8, %f10, %f9;\n" \
+    "    fma.rn.f32      %f1, %f1, %f10, %f9;\n" \
+    "    fma.rn.f32      %f2, %f2, %f10, %f9;\n" \
+    "    fma.rn.f32      %f3, %f3, %f10, %f9;\n" \
+    "    fma.rn.f32      %f4, %f4, %f10, %f9;\n" \
+    "    fma.rn.f32      %f5, %f5, %f10, %f9;\n" \
+    "    fma.rn.f32      %f6, %f6, %f10, %f9;\n" \
+    "    fma.rn.f32      %f7, %f7, %f10, %f9;\n" \
+    "    fma.rn.f32      %f8, %f8, %f10, %f9;\n" \
+    "    fma.rn.f32      %f1, %f1, %f10, %f9;\n" \
+    "    fma.rn.f32      %f2, %f2, %f10, %f9;\n" \
+    "    fma.rn.f32      %f3, %f3, %f10, %f9;\n" \
+    "    fma.rn.f32      %f4, %f4, %f10, %f9;\n" \
+    "    fma.rn.f32      %f5, %f5, %f10, %f9;\n" \
+    "    fma.rn.f32      %f6, %f6, %f10, %f9;\n" \
+    "    fma.rn.f32      %f7, %f7, %f10, %f9;\n" \
+    "    fma.rn.f32      %f8, %f8, %f10, %f9;\n" \
+    "    fma.rn.f32      %f1, %f1, %f10, %f9;\n" \
+    "    fma.rn.f32      %f2, %f2, %f10, %f9;\n" \
+    "    fma.rn.f32      %f3, %f3, %f10, %f9;\n" \
+    "    fma.rn.f32      %f4, %f4, %f10, %f9;\n" \
+    "    fma.rn.f32      %f5, %f5, %f10, %f9;\n" \
+    "    fma.rn.f32      %f6, %f6, %f10, %f9;\n" \
+    "    fma.rn.f32      %f7, %f7, %f10, %f9;\n" \
+    "    fma.rn.f32      %f8, %f8, %f10, %f9;\n" \
+    "    fma.rn.f32      %f1, %f1, %f10, %f9;\n" \
+    "    fma.rn.f32      %f2, %f2, %f10, %f9;\n" \
+    "    fma.rn.f32      %f3, %f3, %f10, %f9;\n" \
+    "    fma.rn.f32      %f4, %f4, %f10, %f9;\n" \
+    "    fma.rn.f32      %f5, %f5, %f10, %f9;\n" \
+    "    fma.rn.f32      %f6, %f6, %f10, %f9;\n" \
+    "    fma.rn.f32      %f7, %f7, %f10, %f9;\n" \
+    "    fma.rn.f32      %f8, %f8, %f10, %f9;\n" \
+    "    fma.rn.f32      %f1, %f1, %f10, %f9;\n" \
+    "    fma.rn.f32      %f2, %f2, %f10, %f9;\n" \
+    "    fma.rn.f32      %f3, %f3, %f10, %f9;\n" \
+    "    fma.rn.f32      %f4, %f4, %f10, %f9;\n" \
+    "    fma.rn.f32      %f5, %f5, %f10, %f9;\n" \
+    "    fma.rn.f32      %f6, %f6, %f10, %f9;\n" \
+    "    fma.rn.f32      %f7, %f7, %f10, %f9;\n" \
+    "    fma.rn.f32      %f8, %f8, %f10, %f9;\n" \
+    "    fma.rn.f32      %f1, %f1, %f10, %f9;\n" \
+    "    fma.rn.f32      %f2, %f2, %f10, %f9;\n" \
+    "    fma.rn.f32      %f3, %f3, %f10, %f9;\n" \
+    "    fma.rn.f32      %f4, %f4, %f10, %f9;\n" \
+    "    fma.rn.f32      %f5, %f5, %f10, %f9;\n" \
+    "    fma.rn.f32      %f6, %f6, %f10, %f9;\n" \
+    "    fma.rn.f32      %f7, %f7, %f10, %f9;\n" \
+    "    fma.rn.f32      %f8, %f8, %f10, %f9;\n" \
+    "\n" \
+    "    add.u32         %r1, %r1, -1;\n" \
+    "    setp.gt.u32     %p1, %r1, 0;\n" \
+    "    @%p1 bra        LOOP;\n" \
+    "\n" \
+    "    add.f32         %f1, %f1, %f2;\n" \
+    "    add.f32         %f3, %f3, %f4;\n" \
+    "    add.f32         %f5, %f5, %f6;\n" \
+    "    add.f32         %f7, %f7, %f8;\n" \
+    "    add.f32         %f1, %f1, %f3;\n" \
+    "    add.f32         %f5, %f5, %f7;\n" \
+    "    add.f32         %f1, %f1, %f5;\n" \
+    "\n" \
+    "    mad.wide.u32    %rd2, %r2, 4, %rd1;\n" \
+    "    st.global.f32   [%rd2], %f1;\n" \
     "    ret;\n"
+
+#define FMA_PER_LOOP 64  /* 每轮循环里每条线程的 FMA 指令数，用于算实测算力 */
 
 /* 按顺序尝试：正常情况第一个就能被 JIT，后面几个只是给老/新驱动留退路
    （sm_80 + PTX ISA 7.0 是 CUDA 11.0 起就有的组合，A100 必然满足）。*/
@@ -439,6 +512,7 @@ typedef struct {
     int churn_mb;
     int check;
     int diag;
+    double peak_tflops; /* FP32 峰值（TFLOPS），0 = 按卡名自动猜，用于算占比 */
 } Args;
 
 typedef struct Runtime {
@@ -466,6 +540,7 @@ typedef struct Runtime {
     pthread_t churn_tid;
     int churn_started;
     int nvml_ok;
+    double peak_tflops; /* 本线程这张卡的 FP32 峰值，0=未知（不打占比） */
     int failed;     /* 本卡失败次数：只影响本线程，不拖累别的卡 */
     int churn_stop; /* 通知 churn 线程收工（每张卡一个 churn 线程） */
 } Runtime;
@@ -618,7 +693,7 @@ static int build_ptx(size_t idx, char *buf, size_t cap)
 
 static int load_kernel(void)
 {
-    char ptx[4096];
+    char ptx[16384];
     for (size_t i = 0; i < sizeof KERNEL_VARIANTS / sizeof *KERNEL_VARIANTS; i++) {
         const KernelVariant *v = &KERNEL_VARIANTS[i];
         if (!build_ptx(i, ptx, sizeof ptx)) {
@@ -762,6 +837,17 @@ static void print_stats(const Args *a, double elapsed)
     (void)a;
     line[0] = '\0';
     appendf(line, sizeof line, &len, "运行 %6.1fs | kernel 发射 %llu 次", elapsed, R.launches);
+    /* 实测算力 = 发射的 kernel 数 x grid x block x iters x FMA/轮 x 2 flop */
+    double tflops = 0.0;
+    if (elapsed > 0.2 && R.launches > 0) {
+        double flops = (double)R.launches * (double)R.grid * (double)R.block * (double)R.iters *
+                       (double)FMA_PER_LOOP * 2.0;
+        tflops = flops / elapsed / 1e12;
+        appendf(line, sizeof line, &len, " | 实测算力 %.1f TFLOPS", tflops);
+        if (R.peak_tflops > 0.0)
+            appendf(line, sizeof line, &len, "（FP32 峰值 %.1f，占 %.0f%%）", R.peak_tflops,
+                    100.0 * tflops / R.peak_tflops);
+    }
     size_t free_ = 0, total = 0;
     if (g_cu.cuMemGetInfo(&free_, &total) == CUDA_SUCCESS)
         appendf(line, sizeof line, &len, " | 显存 %s/%s",
@@ -889,6 +975,20 @@ static void setup(const Args *a)
     g_cu.cuDeviceGetAttribute(&R.max_threads, CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK, dev);
     logmsg("设备 #%d: %s  (sm_%d%d, %d SM)", a->device, name[0] ? name : "未知", cc_major,
            cc_minor, R.sms);
+    /* 只为了把"实测算力"换算成百分比：各卡 FP32 峰值不一样，猜不到就当没有 */
+    R.peak_tflops = a->peak_tflops;
+    if (R.peak_tflops <= 0.0) {
+        if (strstr(name, "A100"))
+            R.peak_tflops = 19.5;
+        else if (strstr(name, "H100") || strstr(name, "H800"))
+            R.peak_tflops = 66.9;
+        else if (strstr(name, "V100"))
+            R.peak_tflops = 15.7;
+        else if (strstr(name, "L40"))
+            R.peak_tflops = 90.5;
+        else
+            R.peak_tflops = 0.0;
+    }
     if (R.max_threads <= 0)
         R.max_threads = 1024;
 
@@ -1460,6 +1560,8 @@ static void usage(FILE *out)
             "  --churn-mb MB       churn 单次拷贝大小（默认 512）\n"
             "  --check             只做环境自检和短时试跑，然后退出\n"
             "  --diag              逐步检查驱动/CUDA 链路，打印每一步的结果（排障用）\n"
+            "  --peak-tflops F     FP32 峰值算力（TFLOPS），用于把实测算力换算成百分比\n"
+            "                      默认 0=按卡名猜（A100 19.5），无法识别就不打占比\n"
             "  --quiet             只打错误\n"
             "  --version           打印版本\n"
             "  -h, --help          打印本页\n"
@@ -1469,7 +1571,7 @@ static void usage(FILE *out)
             "  gpu_burn --mem-gb 70             # 固定占 70GiB\n"
             "  gpu_burn --duration 1800         # 刷 30 分钟\n"
             "  gpu_burn --churn --stats 2       # 顺带刷显存带宽\n"
-            "  gpu_burn --devices all           # 每张卡一个子进程，全部刷起来\n"
+            "  gpu_burn --devices all           # 每张卡一个线程，全部刷起来\n"
             "  gpu_burn --devices 0,2           # 只刷 0 号和 2 号卡\n"
             "  gpu_burn --check                 # 只自检，不常驻\n");
 }
@@ -1492,6 +1594,7 @@ int main(int argc, char **argv)
     a.churn = 0;
     a.churn_mb = 512;
     a.check = 0;
+    a.peak_tflops = 0.0;
 
     static const struct option opt[] = {
         {"device", required_argument, 0, 'd'},
@@ -1510,6 +1613,7 @@ int main(int argc, char **argv)
         {"churn-mb", required_argument, 0, 'C'},
         {"check", no_argument, 0, 'k'},
         {"diag", no_argument, 0, 'X'},
+        {"peak-tflops", required_argument, 0, 'F'},
         {"quiet", no_argument, 0, 'Q'},
         {"dump-ptx", no_argument, 0, 'P'},
         {"version", no_argument, 0, 'V'},
@@ -1536,9 +1640,10 @@ int main(int argc, char **argv)
         case 'C': a.churn_mb = atoi(optarg); break;
         case 'k': a.check = 1; break;
         case 'X': a.diag = 1; break;
+        case 'F': a.peak_tflops = atof(optarg); break;
         case 'Q': g_quiet = 1; break;
         case 'P': {
-            static char buf[4096];
+            static char buf[16384];
             int n = build_ptx(0, buf, sizeof buf);
             if (n <= 0) {
                 errmsg("PTX 文本超出缓冲区");

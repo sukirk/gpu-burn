@@ -25,7 +25,7 @@ import time
 from ctypes import (POINTER, Structure, byref, c_char_p, c_float, c_int,
                     c_size_t, c_uint, c_uint32, c_uint64, c_void_p)
 
-VERSION = "1.1.1"
+VERSION = "1.2.0"
 MAX_DEVICES = 32  # --devices all 最多展开这么多张，防手滑
 
 CUDA_SUCCESS = 0
@@ -43,9 +43,10 @@ CU_EVENT_DEFAULT = 0x0
 # --------------------------------------------------------------------------- #
 # kernel 源码：内联 PTX
 #
-# 每个线程做一个固定次数的循环，循环体是 4 条互相独立的 FP32 FMA（加一个递减
-# 计数器和分支）。选 4 条独立 FMA 是为了让每个 SM 的 4 个 warp 调度器都能被占满：
-# 每轮 7 条指令里 4 条是 FMA，正好卡在 FP32 吞吐上，既不空转也不被整数指令拖走。
+# 每个线程做 iters 轮循环，每轮 64 条互相独立的 FP32 FMA（8 个累加器 × 8 次展开），
+# 另加 1 条计数器递减和 1 个分支。指令流里 64/67 是 FMA，远高于打满 FP32 流水线所需的
+# 50%（每个 SM 每周期 4 个发射槽，最多 2 个能是 FFMA），所以瓶颈落在浮点吞吐而不是循环
+# 开销上。8 个累加器让同一累加器相邻两次 FMA 相隔 8 条指令，覆盖 FFMA 的 4 周期延迟。
 # 累加器用 a = 0.5*a + seed 的形式，保证数值有界（不会 Inf/NaN），同时因为系数和
 # seed 都来自寄存器，ptxas 无法把它折叠掉。循环结束每线程写一次全局内存，
 # 防止整个循环被当成死代码删掉。
@@ -59,52 +60,122 @@ _PTX_HEADER = """\
 // program needs no CUDA toolkit, no nvcc and no per-architecture cubin.
 //
 //   params: (u64 out_ptr, u32 iters)
-//   each thread: iters * 4 FMA on 4 independent accumulators, then one store so
+//   each thread: iters * 64 FMA (8 accumulators x 8 unrolled) then one store so
 //   ptxas cannot prove the loop dead.
 //
 """
 
+_KERNEL_SIG = ""
+
 _KERNEL_BODY = """
+.visible .entry gpu_burn_kernel(
+    .param .u64 out_ptr,
+    .param .u32 iters
+)
+{
+
     .reg .pred  %p1;
     .reg .b32   %r1, %r2;
     .reg .b64   %rd1, %rd2;
-    .reg .f32   %f1, %f2, %f3, %f4, %f5, %f6;
+    .reg .f32   %f1, %f2, %f3, %f4, %f5, %f6, %f7, %f8, %f9, %f10;
 
     ld.param.u64    %rd1, [out_ptr];
     ld.param.u32    %r1,  [iters];
 
     mov.u32         %r2, %tid.x;
-    cvt.rn.f32.u32  %f5, %r2;           // per-thread seed
+    cvt.rn.f32.u32  %f9, %r2;           // per-thread seed
+    mov.f32         %f10, 0f3F000000;   // 0.5
     mov.f32         %f1, 0f3F800000;    // 1.0
-    mov.f32         %f2, 0f3F800000;
-    mov.f32         %f3, 0f3F800000;
-    mov.f32         %f4, 0f3F800000;
-    mov.f32         %f6, 0f3F000000;    // 0.5
+    mov.f32         %f2, 0f3F800000;    // 1.0
+    mov.f32         %f3, 0f3F800000;    // 1.0
+    mov.f32         %f4, 0f3F800000;    // 1.0
+    mov.f32         %f5, 0f3F800000;    // 1.0
+    mov.f32         %f6, 0f3F800000;    // 1.0
+    mov.f32         %f7, 0f3F800000;    // 1.0
+    mov.f32         %f8, 0f3F800000;    // 1.0
 
 LOOP:
-    fma.rn.f32      %f1, %f1, %f6, %f5;
-    fma.rn.f32      %f2, %f2, %f6, %f5;
-    fma.rn.f32      %f3, %f3, %f6, %f5;
-    fma.rn.f32      %f4, %f4, %f6, %f5;
+    fma.rn.f32      %f1, %f1, %f10, %f9;
+    fma.rn.f32      %f2, %f2, %f10, %f9;
+    fma.rn.f32      %f3, %f3, %f10, %f9;
+    fma.rn.f32      %f4, %f4, %f10, %f9;
+    fma.rn.f32      %f5, %f5, %f10, %f9;
+    fma.rn.f32      %f6, %f6, %f10, %f9;
+    fma.rn.f32      %f7, %f7, %f10, %f9;
+    fma.rn.f32      %f8, %f8, %f10, %f9;
+    fma.rn.f32      %f1, %f1, %f10, %f9;
+    fma.rn.f32      %f2, %f2, %f10, %f9;
+    fma.rn.f32      %f3, %f3, %f10, %f9;
+    fma.rn.f32      %f4, %f4, %f10, %f9;
+    fma.rn.f32      %f5, %f5, %f10, %f9;
+    fma.rn.f32      %f6, %f6, %f10, %f9;
+    fma.rn.f32      %f7, %f7, %f10, %f9;
+    fma.rn.f32      %f8, %f8, %f10, %f9;
+    fma.rn.f32      %f1, %f1, %f10, %f9;
+    fma.rn.f32      %f2, %f2, %f10, %f9;
+    fma.rn.f32      %f3, %f3, %f10, %f9;
+    fma.rn.f32      %f4, %f4, %f10, %f9;
+    fma.rn.f32      %f5, %f5, %f10, %f9;
+    fma.rn.f32      %f6, %f6, %f10, %f9;
+    fma.rn.f32      %f7, %f7, %f10, %f9;
+    fma.rn.f32      %f8, %f8, %f10, %f9;
+    fma.rn.f32      %f1, %f1, %f10, %f9;
+    fma.rn.f32      %f2, %f2, %f10, %f9;
+    fma.rn.f32      %f3, %f3, %f10, %f9;
+    fma.rn.f32      %f4, %f4, %f10, %f9;
+    fma.rn.f32      %f5, %f5, %f10, %f9;
+    fma.rn.f32      %f6, %f6, %f10, %f9;
+    fma.rn.f32      %f7, %f7, %f10, %f9;
+    fma.rn.f32      %f8, %f8, %f10, %f9;
+    fma.rn.f32      %f1, %f1, %f10, %f9;
+    fma.rn.f32      %f2, %f2, %f10, %f9;
+    fma.rn.f32      %f3, %f3, %f10, %f9;
+    fma.rn.f32      %f4, %f4, %f10, %f9;
+    fma.rn.f32      %f5, %f5, %f10, %f9;
+    fma.rn.f32      %f6, %f6, %f10, %f9;
+    fma.rn.f32      %f7, %f7, %f10, %f9;
+    fma.rn.f32      %f8, %f8, %f10, %f9;
+    fma.rn.f32      %f1, %f1, %f10, %f9;
+    fma.rn.f32      %f2, %f2, %f10, %f9;
+    fma.rn.f32      %f3, %f3, %f10, %f9;
+    fma.rn.f32      %f4, %f4, %f10, %f9;
+    fma.rn.f32      %f5, %f5, %f10, %f9;
+    fma.rn.f32      %f6, %f6, %f10, %f9;
+    fma.rn.f32      %f7, %f7, %f10, %f9;
+    fma.rn.f32      %f8, %f8, %f10, %f9;
+    fma.rn.f32      %f1, %f1, %f10, %f9;
+    fma.rn.f32      %f2, %f2, %f10, %f9;
+    fma.rn.f32      %f3, %f3, %f10, %f9;
+    fma.rn.f32      %f4, %f4, %f10, %f9;
+    fma.rn.f32      %f5, %f5, %f10, %f9;
+    fma.rn.f32      %f6, %f6, %f10, %f9;
+    fma.rn.f32      %f7, %f7, %f10, %f9;
+    fma.rn.f32      %f8, %f8, %f10, %f9;
+    fma.rn.f32      %f1, %f1, %f10, %f9;
+    fma.rn.f32      %f2, %f2, %f10, %f9;
+    fma.rn.f32      %f3, %f3, %f10, %f9;
+    fma.rn.f32      %f4, %f4, %f10, %f9;
+    fma.rn.f32      %f5, %f5, %f10, %f9;
+    fma.rn.f32      %f6, %f6, %f10, %f9;
+    fma.rn.f32      %f7, %f7, %f10, %f9;
+    fma.rn.f32      %f8, %f8, %f10, %f9;
+
     add.u32         %r1, %r1, -1;
     setp.gt.u32     %p1, %r1, 0;
     @%p1 bra        LOOP;
 
     add.f32         %f1, %f1, %f2;
     add.f32         %f3, %f3, %f4;
+    add.f32         %f5, %f5, %f6;
+    add.f32         %f7, %f7, %f8;
     add.f32         %f1, %f1, %f3;
+    add.f32         %f5, %f5, %f7;
+    add.f32         %f1, %f1, %f5;
 
     mad.wide.u32    %rd2, %r2, 4, %rd1;
     st.global.f32   [%rd2], %f1;
     ret;
 """
-
-_KERNEL_SIG = (
-    "\n.visible .entry gpu_burn_kernel(\n"
-    "    .param .u64 out_ptr,\n"
-    "    .param .u32 iters\n"
-    ")\n{\n"
-)
 
 # 按顺序尝试：正常情况第一个就能被 JIT，后面几个只是给老/新驱动留退路
 # （sm_80 + PTX ISA 7.0 是 CUDA 11.0 起就有的组合，A100 必然满足）。
@@ -113,6 +184,8 @@ KERNEL_VARIANTS = (
     ("sm_80 / PTX ISA 8.0", _PTX_HEADER + ".version 8.0\n.target sm_80\n.address_size 64\n" + _KERNEL_SIG + _KERNEL_BODY + "}\n"),
     ("sm_70 / PTX ISA 6.4", _PTX_HEADER + ".version 6.4\n.target sm_70\n.address_size 64\n" + _KERNEL_SIG + _KERNEL_BODY + "}\n"),
 )
+
+FMA_PER_LOOP = 64  # 每轮循环里每条线程的 FMA 数，用于算实测算力
 
 DRIVER_CANDIDATES = (
     "libcuda.so.1",
@@ -591,6 +664,7 @@ class Burner(object):
         self.block = 256
         self.grid = 1
         self.iters = 0
+        self.peak_tflops = 0.0
         self.streams = []
         self.inflight = []
         self.depth = 4
@@ -622,6 +696,17 @@ class Burner(object):
         self.max_threads = cu.attr(dev, CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK) or 1024
         self.log("设备 #%d: %s  (sm_%s%s, %d SM)"
                  % (args.device, name, cc_major, cc_minor, self.sms))
+        # 只为了把"实测算力"换算成百分比：各卡 FP32 峰值不一样，猜不到就不打占比
+        self.peak_tflops = getattr(args, "peak_tflops", 0.0) or 0.0
+        if self.peak_tflops <= 0.0:
+            if "A100" in name:
+                self.peak_tflops = 19.5
+            elif "H100" in name or "H800" in name:
+                self.peak_tflops = 66.9
+            elif "V100" in name:
+                self.peak_tflops = 15.7
+            elif "L40" in name:
+                self.peak_tflops = 90.5
 
         self.ctx = cu.ctx_create(dev)
         free, total = cu.mem_info()
@@ -760,6 +845,15 @@ class Burner(object):
     def _print_stats(self, elapsed):
         cu = self.cu
         parts = ["运行 %6.1fs" % elapsed, "kernel 发射 %d 次" % self.launches]
+        # 实测算力 = 发射的 kernel 数 x grid x block x iters x FMA/轮 x 2 flop
+        if elapsed > 0.2 and self.launches > 0:
+            flops = (float(self.launches) * self.grid * self.block * self.iters
+                     * FMA_PER_LOOP * 2.0)
+            tflops = flops / elapsed / 1e12
+            parts.append("实测算力 %.1f TFLOPS" % tflops)
+            if self.peak_tflops > 0.0:
+                parts.append("（FP32 峰值 %.1f，占 %.0f%%）"
+                             % (self.peak_tflops, 100.0 * tflops / self.peak_tflops))
         try:
             free, total = cu.mem_info()
             parts.append("显存 %s/%s" % (_human(total - free), _human(total)))
@@ -859,6 +953,8 @@ def build_parser():
     p.add_argument("--churn-mb", type=int, default=512, metavar="MB", help="churn 单次拷贝大小(默认 512)")
     p.add_argument("--check", action="store_true", help="只做环境自检和短时试跑，然后退出")
     p.add_argument("--diag", action="store_true", help="逐步检查驱动/CUDA 链路（排障用）")
+    p.add_argument("--peak-tflops", type=float, default=0.0, metavar="F",
+                   help="FP32 峰值算力(TFLOPS)，用于换算实测算力占比；0=按卡名猜")
     p.add_argument("--dump-ptx", action="store_true",
                    help="打印实际交给驱动的 PTX 文本后退出（调试/校验用）")
     p.add_argument("--quiet", action="store_true", help="只打错误")

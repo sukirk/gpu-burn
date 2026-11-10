@@ -58,7 +58,8 @@ static size_t g_used_dev[64];                                /* 每张卡各自�
 static int g_sms = 108;
 static int g_devs = 1;               /* MOCK_DEVS：假装机器上有几张卡 */
 static const char *g_name = "Mock A100-SXM4-80GB";
-static double g_speed = 1.5e12;      /* 线程-迭代数/秒，逼近 A100 FP32 峰值 */
+static double g_speed = 9.75e12;     /* FMA/秒（A100 FP32 19.5 TFLOPS ≈ 9.75e12 FMA/s） */
+static double g_fma = 64.0;          /* 每条线程每轮循环的 FMA 数，跟 kernel 保持一致 */
 static size_t g_oom_after = 0;       /* 非 0：used 超过它之后一律 OOM */
 static int g_fail_launch_at = 0;     /* 非 0：第 N 次 cuLaunchKernel 注入错误 */
 static int g_fail_code = 999;        /* 注入的错误码（999 = CUDA_ERROR_UNKNOWN） */
@@ -141,7 +142,9 @@ static void env_init_locked(void)
     if ((s = getenv("MOCK_NAME")))
         g_name = s;
     if ((s = getenv("MOCK_SPEED")))
-        g_speed = atof(s);
+        g_speed = atof(s);   /* 单位：FMA/秒 */
+    if ((s = getenv("MOCK_FMA")))
+        g_fma = atof(s);
     if ((s = getenv("MOCK_OOM_AFTER_GB")))
         g_oom_after = (size_t)(atof(s) * (double)(1ull << 30));
     if ((s = getenv("MOCK_USED_GB"))) {   /* 模拟「被别的进程占掉」的显存，每张卡都占 */
@@ -499,7 +502,7 @@ CUresult cuLaunchKernel(CUfunction fn, unsigned int gx, unsigned int gy, unsigne
     if (!m)
         return E_INVALID_HANDLE;
     double threads = (double)gx * bx;
-    double secs = ((double)iters * threads) / g_speed;
+    double secs = ((double)iters * threads * g_fma) / g_speed;
     m->busy_until = (m->busy_until > now_s() ? m->busy_until : now_s()) + secs;
     vlog("mock: cuLaunchKernel grid=%u block=%u iters=%u -> %.1f ms", gx, bx, iters, secs * 1e3);
     return OK;

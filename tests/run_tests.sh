@@ -72,6 +72,13 @@ out="$TMP/run.txt"
 LD_LIBRARY_PATH="$MOCK" MOCK_LOG="$LOG" "$PY" "$PYBIN" --duration 2 --stats 1 --target-ms 40 >"$out" 2>&1
 expect "常驻刷 2 秒后自行退出" $? "$out" "已释放显存与 CUDA 上下文"
 expect "统计行带利用率" $? "$out" "GPU 利用率 99%"
+expect "统计行带实测算力" $? "$out" "实测算力 1[5-9]\\."
+expect "统计行带 FP32 峰值占比" $? "$out" "占 100%"
+
+# 3b) 实测算力按 --peak-tflops 换算百分比（mock 模拟的是 19.5 TFLOPS 的卡）
+out="$TMP/flops.txt"
+LD_LIBRARY_PATH="$MOCK" "$PY" "$PYBIN" --duration 2 --stats 1 --target-ms 40 --peak-tflops 39 >"$out" 2>&1
+expect "--peak-tflops 换算占比" $? "$out" "占 50%"
 
 # 4) 显存不足时的降级（OOM 后减半重试，再拿不到就带已有量继续跑）
 out="$TMP/oom.txt"
@@ -134,6 +141,7 @@ if [ -n "$BIN" ] && [ -x "$BIN" ]; then
     out="$TMP/bin_run.txt"
     LD_LIBRARY_PATH="$MOCK" "$BIN" --duration 2 --stats 1 --target-ms 40 >"$out" 2>&1
     expect "原生版常驻刷" $? "$out" "已释放显存与 CUDA 上下文"
+    expect "原生版统计行带实测算力" $? "$out" "实测算力 1[5-9]\\."
     out="$TMP/bin_sig.txt"
     LD_LIBRARY_PATH="$MOCK" "$BIN" --stats 0 --target-ms 40 >"$out" 2>&1 &
     pid=$!

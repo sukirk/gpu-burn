@@ -27,6 +27,9 @@ docker run --rm \
         apt-get update -qq
         DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
             gcc libc6-dev make python3 binutils >/dev/null
+        # 宿主上可能已经编过一份更高 glibc 的二进制，make 会以为它是最新的，
+        # 于是拿宿主的二进制在容器里跑测试（报 GLIBC_2.xx not found）。先清掉。
+        make clean
         make
         make check
         echo "==> glibc 最高要求：$(objdump -T gpu_burn | grep -o "GLIBC_[0-9.]*" | sort -Vu | tail -1)"
