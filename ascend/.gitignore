@@ -1,0 +1,8 @@
+# 编译产物
+gpu_burn_ascend
+tests/mock/*.so*
+
+# 测试产物
+tests/.out/
+tests/.mock.log
+tests/.npu-smi.mock

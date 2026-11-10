@@ -17,6 +17,15 @@
 每个包里附了 `BUILD-INFO`，写着编译环境、gcc 版本和这个二进制要求的最高 glibc 符号版本。
 拿不准就下 `ubuntu-20.04` 那个，要求最低，在更新的发行版上照样能跑。
 
+昇腾 NPU 版是单独的包，x86_64 和 aarch64 各一个：
+
+| 文件 | 架构 / 编译环境 |
+| --- | --- |
+| `gpu-burn-ascend-*-linux-x86_64-ubuntu-22.04.tar.gz` | x86_64 / ubuntu 22.04 |
+| `gpu-burn-ascend-*-linux-aarch64-ubuntu-22.04.tar.gz` | aarch64 / ubuntu 22.04 |
+
+昇腾包在装好 CANN 的机器上跑（`libascendcl.so`），第一次先 `./gpu_burn_ascend --diag`。
+
 ## 用
 
 ```bash

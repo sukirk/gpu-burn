@@ -22,12 +22,14 @@ $ ./gpu_burn --check
 - **自适应**：启动时自动标定 kernel 时长，换卡、换驱动不用改参数
 - **PTX JIT**：计算 kernel 以内联 PTX 交给驱动编译，一份程序覆盖 sm_70 及以上
 - **显存占满**：按空闲比例（`--mem-pct`）或绝对值（`--mem-gb`）分配，OOM 自动降级
-- **利用率拉满**：每线程 4 条独立 FP32 FMA 并行发射，填满每个 SM 的 4 个 warp 调度器
+- **吃满浮点管线**：kernel 每轮循环 64 条 FMA + 3 条循环开销（指令里 95% 是 FMA），8 个累加器互相独立，FP32 流水线按设计满负荷；运行中直接报**实测算力**（TFLOPS）和它占峰值的百分比
 - **可选带宽压测**：`--churn` 额外做 device-to-device 拷贝
 - **多卡**：`--devices all` 或 `--devices 0,2`，一个进程里每张卡一个线程，一起刷一起收尾
 - **干净退出**：`Ctrl-C` / `SIGTERM` / `SIGHUP` 都会排干队列、释放显存再退出
 - **状态可见**：周期性打印利用率、显存、温度、功耗（容器内有 NVML 时）
 - **附带 Python 版**：`python/gpu_burn.py`，只用标准库，作为没有编译环境时的备选
+- **昇腾 NPU 版**：`ascend/` 里是同一套思路的 `gpu_burn_ascend`，dlopen CANN 的 `libascendcl.so`，
+  单进程里每张芯片一个线程（见[昇腾 NPU 版](#昇腾-npu-版gpu_burn_ascend)）
 
 ## 环境要求
 
@@ -51,6 +53,13 @@ $ ./gpu_burn --check
 | `gpu-burn-VERSION-linux-x86_64-ubuntu-22.04.tar.gz` | ubuntu 22.04 / gcc 11 |
 | `gpu-burn-VERSION-linux-x86_64-debian-12.tar.gz` | debian 12 / gcc 12 |
 | `gpu-burn-VERSION-linux-x86_64-ubuntu-24.04.tar.gz` | ubuntu 24.04 / gcc 13 |
+
+昇腾版单独出包（x86_64 和 aarch64 各一个，NPU 服务器两种架构都有）：
+
+| 文件 | 架构 / 编译环境 |
+| --- | --- |
+| `gpu-burn-ascend-VERSION-linux-x86_64-ubuntu-22.04.tar.gz` | x86_64 / ubuntu 22.04 |
+| `gpu-burn-ascend-VERSION-linux-aarch64-ubuntu-22.04.tar.gz` | aarch64 / ubuntu 22.04 |
 
 包里是 `gpu_burn` + `README.md` + `LICENSE` + `BUILD-INFO`（编译环境、gcc 版本、这个二进制要求的最高 glibc 符号版本）。
 拿不准就下 `ubuntu-20.04` 那个，要求最低，在更新的发行版上照样能跑。
@@ -129,6 +138,8 @@ docker run --gpus all -it -v "$PWD":/opt/gpu-burn <你的镜像> \
   --churn-mb MB       churn 单次拷贝大小（默认 512）
   --check             只做环境自检和短时试跑，然后退出
   --diag              逐步检查驱动/CUDA 链路，打印每一步的结果（排障用）
+  --peak-tflops F     FP32 峰值算力（TFLOPS），用来把实测算力换算成百分比
+                      默认 0=按卡名猜（A100 19.5 / H100 66.9），识别不了就不打占比
   --quiet             只打错误
   --version           打印版本
   -h, --help          打印本页
@@ -168,9 +179,12 @@ docker run --gpus all -it -v "$PWD":/opt/gpu-burn <你的镜像> \
 运行期间的统计行长这样（数字随卡、随参数变化）：
 
 ```
-[gpu_burn 09:41:12] 发射配置: grid=864  block=256  streams=1  iters=811710
-[gpu_burn 09:41:17] 运行   10.4s | kernel 发射 87 次 | 显存 48.00 GiB/80.00 GiB | GPU 利用率 99% | 显存带宽 41% | 71C | 398W
+[gpu_burn 09:41:12] 发射配置: grid=864  block=256  streams=1  iters=82400
+[gpu_burn 09:41:17] 运行   10.4s | kernel 发射 87 次 | 实测算力 19.4 TFLOPS（FP32 峰值 19.5，占 99%） | 显存 48.00 GiB/80.00 GiB | GPU 利用率 99% | 显存带宽 41% | 71C | 398W
 ```
+
+「实测算力」是程序自己算的：`发射 kernel 数 × grid × block × iters × 64 FMA × 2 flop / 耗时`，
+不依赖任何监控组件，可以拿来跟监控面板上的浮点利用率对照。
 
 一次 `--check` 会依次验证：驱动库能否加载 → 设备可见 → 能分配并写入 256MiB 显存 →
 PTX 能被 JIT → kernel 能执行。哪一步失败会直接给出要查的东西。
@@ -179,6 +193,35 @@ PTX 能被 JIT → kernel 能执行。哪一步失败会直接给出要查的东
 JIT、小规模 launch、满规模 launch……），每一步单独打印 OK/失败，适合在真卡上定位
 "到底哪一步不行"。所有 CUDA 报错都带错误码（例如 `unknown (rc=999)`），
 `rc=999` / `rc=719` / `rc=700` 基本都是设备侧错误（kernel 非法访问、上下文丢失）。
+
+### 浮点利用率与调参
+
+`nvidia-smi` 里的 **GPU-Util** 只表示"这段时间里 GPU 上有 kernel 在跑"，跟浮点管线忙不忙没关系——
+一个几乎不干活的 kernel 也能把它顶到 100%。要看浮点，得看 **FP32 管线的活跃周期占比**
+（DCGM 的 `PIPE_FP32_ACTIVE` 这类字段，或监控面板上的"浮点利用率"），或者直接看程序报的实测算力。
+
+这个 kernel 是照着"把 FP32 流水线压满"设计的：
+
+- 每轮循环 **64 条 FFMA + 3 条循环开销**，指令流里 95% 是 FMA。A100 每个 SM 每周期 4 个发射槽，
+  其中最多 2 个能发 FFMA（每 SM 64 个 FP32 核 = 每个调度器 16 个，一条 warp 指令占 2 周期），
+  所以只要 FMA 占比 > 50% 就能把 FP32 管线打满；
+- **8 个累加器**，同一累加器相邻两次 FMA 隔 8 条指令，覆盖 FFMA 的 4 周期延迟，不会出现依赖停顿；
+- 默认 `--blocks-per-sm 8 --threads 256`，恰好 2048 线程/SM（A100 的上限），寄存器 20 个，
+  不挤占 occupancy；`--queue-depth 4` 保证前一个 kernel 还没算完下一个就排上了，SM 不会空转。
+
+在这套配置下，实测算力应该贴着 FP32 峰值（A100 80GB ≈ 19.5 TFLOPS）。如果监控面板上的
+浮点利用率仍然明显偏低，按这个顺序排查：
+
+| 检查项 | 做法 |
+| --- | --- |
+| 先看实测算力是否到峰值 | `--stats 1` 看 `实测算力`。到了 19 TFLOPS 说明卡确实被压满了，面板那个百分比是别的口径（采样窗口、虚拟化统计、或者混了别的 pipe） |
+| 别开 `--churn` | 它抢显存带宽和指令槽，纯刷浮点时不要开 |
+| 别开多 stream | 单 stream + `queue-depth 4` 已经排满，`--streams 2` 只会多消耗上下文切换 |
+| 卡上还有别的进程 | 显存/带宽被抢会拉低有效算力，`nvidia-smi` 看有没有别的进程，或者用 `--mem-gb` 少占点 |
+| 降频 / 功耗墙 | `nvidia-smi -q -d CLOCK,PERFORMANCE` 看是不是被 power/thermal 限了；共享池化平台上很常见 |
+
+想把占比数字对得更准，用 `--peak-tflops` 填你那张卡的 FP32 峰值：A100 80GB 19.5、A100 40GB 19.5、
+H100 SXM 66.9、V100 15.7。
 
 ### 退出码与信号
 
@@ -191,6 +234,30 @@ JIT、小规模 launch、满规模 launch……），每一步单独打印 OK/�
 `Ctrl-C`、`SIGTERM`、`SIGHUP` 都会走同一套收尾：排队等 GPU 干完 → 释放所有显存 →
 销毁 stream / module / context。多卡模式下每张卡的线程各自收尾；被 `kill -9` 时进程直接
 消失，显存由驱动回收。容器被停掉时不会留下占着显存的进程。
+
+## 昇腾 NPU 版（gpu_burn_ascend）
+
+`ascend/` 是昇腾版：同样单文件、只依赖 glibc，CANN 的 `libascendcl.so` 运行时 dlopen，
+不需要 CANN 头文件、不需要 torch_npu、不需要 Python。
+
+可以直接从 Release 下 `gpu-burn-ascend-*` 的包（x86_64 / aarch64），也可以自己编：
+
+```bash
+cd ascend && make                      # 生成 ./gpu_burn_ascend
+./gpu_burn_ascend --check              # 自检：ACL、HBM、MatMul 算子
+./gpu_burn_ascend --diag               # 14 步排障（真机第一次先跑这个）
+./gpu_burn_ascend                      # 占 60% 空闲 HBM，刷 AICore
+./gpu_burn_ascend --devices all --duration 1800
+./gpu_burn_ascend --npu-smi --stats 5  # 顺带把 npu-smi 的 AICore/HBM/温度/功耗读回来
+```
+
+- 兼容 `npu-smi` **24.1.0** 的输出（`--npu-smi` 按板卡行 + 芯片行解析，取 AICore% / HBM / 温度 / 功耗）
+- 一个进程、每张芯片一个线程：`kill` 一次全部收尾，不留孤儿进程（池化平台按进程分配 NPU 会话，所以绝不 fork）
+- 算力靠 `aclopExecuteV2("MatMul")` 打，FP16、`--size` 默认 8192；统计行报**实测 TFLOPS**和累计 TFLOP
+- 参数与 CUDA 版对齐：`--devices`、`--mem-gb`/`--mem-pct`、`--duration`、`--stats`、`--check`、`--diag`、`--quiet`、`--version`，
+  另有 `--size`、`--queue`、`--npu-smi`
+- 测试用假 `libascendcl.so`（`make -C ascend check`），没有 NPU 也能跑；真机的 ACL 原型 / 算子行为
+  第一次请用 `--diag` 确认，细节见 [`ascend/README.md`](ascend/README.md)
 
 ## 编译
 
@@ -214,7 +281,7 @@ CI 会分别在 ubuntu 20.04 / 22.04 / 24.04、debian 12 / 13 上编译并跑测
 ## 测试
 
 `make check` 用 `tests/` 下的假驱动（`mock_libcuda.c`、`mock_nvml.c`）替换真驱动，
-跑 32 项端到端用例：自检、`--diag`、常驻刷、`--duration`、OOM 降级、多 stream、`--churn`、
+跑 36 项端到端用例：自检、`--diag`、常驻刷、`--duration`、OOM 降级、多 stream、`--churn`、
 `SIGTERM` 优雅退出、显存被别的进程占着、设备侧错误带码退出、分配/释放配平、上下文销毁，
 以及多卡相关的 `--devices 0,1` / `--devices all` / 越界卡号 / 只起一个进程 / 单卡失败隔离 /
 `SIGTERM` 后全部释放 / `kill -9` 后无残留进程。原生版和 Python 版各跑一遍。
@@ -234,6 +301,12 @@ CI 会分别在 ubuntu 20.04 / 22.04 / 24.04、debian 12 / 13 上编译并跑测
 │   ├── mock_nvml.c         # 假 libnvidia-ml.so.1
 │   ├── run_tests.sh        # 端到端用例（make check）
 │   └── verify_ptx.sh       # PTX 一致性 / ptxas 校验
+├── ascend/                 # 昇腾 NPU 版
+│   ├── gpu_burn_ascend.c   # 原生实现（单文件）
+│   ├── tests/
+│   │   ├── mock_libascendcl.c   # 假 libascendcl.so，模拟 CANN ACL
+│   │   └── run_tests.sh         # 端到端用例（make -C ascend check）
+│   └── README.md           # 昇腾版专门文档
 └── .github/
     ├── workflows/ci.yml            # 测试 + 五个发行版构建 + 发 Release
     ├── scripts/package.sh          # 打包成 dist/gpu-burn-*.tar.gz
@@ -249,6 +322,7 @@ A100 80GB 单卡，`--mem-pct 0.60` 时：
 | --- | --- |
 | 显存 | ≈ 48 GiB（`--mem-gb 78` 可到 ≈ 78 GiB） |
 | `nvidia-smi` 利用率 | ≈ 100% |
+| 实测算力 | ≈ 19 TFLOPS（FP32 峰值 19.5，占 ≈ 97~100%） |
 | 显存带宽（`--churn`） | 20~45% |
 | 功耗 | 接近 TDP（A100 SXM ≈ 400W） |
 | 温度 | 60~80℃，取决于散热 |
@@ -263,7 +337,8 @@ A100 80GB 单卡，`--mem-pct 0.60` 时：
 | 统计行没有温度/功耗 | 容器里没有 `libnvidia-ml.so.1`，不影响刷 |
 | `所有 PTX 版本都不能被驱动接受` | 驱动太老（早于 CUDA 11），升级宿主机驱动 |
 | `标定失败`、`rc=999`/`rc=719`/`rc=700`、`上下文已丢失` | 设备侧错误。先跑 `--diag` 看卡在哪一步；能过 `--diag` 但刷的时候挂，试 `--streams 1 --queue-depth 2`，或先把卡上别的进程清掉。1.0.0 里标定用的是 CUDA event 计时，在少数共享/虚拟化环境会直接报错，**1.0.1 起改成 host 时钟 + stream 同步，不再依赖 event** |
-| 想知道实际刷到什么程度 | 另开终端 `nvidia-smi -l 1`，或本程序 `--stats 1` |
+| 想知道实际刷到什么程度 | `--stats 1` 看实测算力；或另开终端 `nvidia-smi -l 1` |
+| 面板上浮点利用率不高 | 先看 `--stats 1` 的实测算力：到了 19 TFLOPS 就说明卡已经压满，面板那个数是别的口径。没到再按上面「浮点利用率与调参」一节排查 |
 | 想换成更小的显存占用 | `--mem-pct 0.3` 或 `--mem-gb 16` |
 
 ## 注意
