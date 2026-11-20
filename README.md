@@ -3,7 +3,7 @@
 [![CI](https://github.com/sukirk/gpu-burn/actions/workflows/ci.yml/badge.svg)](https://github.com/sukirk/gpu-burn/actions/workflows/ci.yml)
 
 把 NVIDIA 显卡的显存占满、GPU 利用率刷到接近 100%，用来做压测、烤机、占卡。
-一个 43KB 的单文件二进制，只依赖 glibc。
+CUDA 版是一个 50KB 左右的单文件二进制，只依赖 glibc；另外还有纯 Python 版和昇腾 NPU 版。
 
 ```
 $ ./gpu_burn --check
@@ -18,7 +18,7 @@ $ ./gpu_burn --check
 ## 特性
 
 - **零依赖**：不需要 CUDA Toolkit、nvcc、PyTorch、Python 或任何 pip 包，只要宿主机 NVIDIA 驱动注入的 `libcuda.so.1`
-- **单个二进制**：`gpu_burn` 约 43KB，拷进容器就能跑，glibc ≥ 2.17
+- **单个二进制**：`gpu_burn` 约 50KB，拷进容器就能跑，glibc ≥ 2.17
 - **自适应**：启动时自动标定 kernel 时长，换卡、换驱动不用改参数
 - **PTX JIT**：计算 kernel 以内联 PTX 交给驱动编译，一份程序覆盖 sm_70 及以上
 - **显存占满**：按空闲比例（`--mem-pct`）或绝对值（`--mem-gb`）分配，OOM 自动降级
@@ -27,9 +27,23 @@ $ ./gpu_burn --check
 - **多卡**：`--devices all` 或 `--devices 0,2`，一个进程里每张卡一个线程，一起刷一起收尾
 - **干净退出**：`Ctrl-C` / `SIGTERM` / `SIGHUP` 都会排干队列、释放显存再退出
 - **状态可见**：周期性打印利用率、显存、温度、功耗（容器内有 NVML 时）
-- **附带 Python 版**：`python/gpu_burn.py`，只用标准库，作为没有编译环境时的备选
+- **附带 Python 版**：`python/gpu_burn.py` 只用标准库，作为没有编译环境时的备选；
+  机器上有 PyTorch 时可以用 `python/gpu_burn_torch.py`（cuBLAS GEMM，监控面板上的利用率更容易到 100%）
 - **昇腾 NPU 版**：`ascend/` 里是同一套思路的 `gpu_burn_ascend`，dlopen CANN 的 `libascendcl.so`，
   单进程里每张芯片一个线程（见[昇腾 NPU 版](#昇腾-npu-版gpu_burn_ascend)）
+
+## 实现一览
+
+| 实现 | 入口 | 依赖 | 什么时候用 |
+| --- | --- | --- | --- |
+| CUDA 原生 | `make` → `./gpu_burn` | glibc ≥ 2.17 | 目标镜像没有 CUDA / Python / PyTorch，拷进去就能跑 |
+| CUDA Python（零依赖） | `python/gpu_burn.py` | python3 ≥ 3.6 | 不能编译，但机器上有 python3 |
+| CUDA Python（PyTorch） | `python/gpu_burn_torch.py` | torch | 机器上有 PyTorch；按 cuBLAS GEMM 压，面板利用率最容易到 100% |
+| 昇腾原生 | `make -C ascend` → `ascend/gpu_burn_ascend` | glibc + CANN 运行时 | 910B 等昇腾 NPU，不需要 CANN 头文件 |
+| 昇腾 Python | `python/gpu_burn_ascend.py` | torch + torch_npu | 已装 torch_npu 的昇腾机器 |
+
+CUDA 三种实现的参数是一致的（`--devices` / `--mem-pct` / `--duration` / `--stats` / `--check` …）；
+面板上浮点利用率对不上时先看[浮点利用率与调参](#浮点利用率与调参)。
 
 ## 环境要求
 
@@ -40,7 +54,10 @@ $ ./gpu_burn --check
 | 系统 | Linux x86_64，glibc ≥ 2.17 |
 | 容器 | 以 `--gpus all` 启动（需要宿主机装 nvidia-container-toolkit） |
 | 编译 | gcc + make（只用来编这个程序，不涉及 CUDA） |
-| Python 版 | Python ≥ 3.6，无需 pip 包 |
+| Python 版（零依赖） | Python ≥ 3.6，无需 pip 包 |
+| Python 版（PyTorch） | Python ≥ 3.7 + 任意带 CUDA 的 torch |
+| 昇腾原生版 | CANN ≥ 7（运行时提供 `libascendcl.so`），x86_64 或 aarch64 |
+| 昇腾 Python 版 | CANN + torch + torch_npu |
 
 ## 下载预编译二进制
 
@@ -112,7 +129,7 @@ docker run --gpus all -it -v "$PWD":/opt/gpu-burn <你的镜像> \
 ./gpu_burn --check                  # 只自检，不常驻
 ./gpu_burn --diag                   # 逐步检查驱动 → 显存 → JIT → kernel，排障用
 ./gpu_burn --device 1               # 用第二张卡
-./gpu_burn --devices all            # 机器上所有卡一起刷，每张一个子进程
+./gpu_burn --devices all            # 机器上所有卡一起刷，每张卡一个线程
 ./gpu_burn --devices 0,2            # 只刷 0 号和 2 号卡
 ```
 
@@ -223,6 +240,25 @@ JIT、小规模 launch、满规模 launch……），每一步单独打印 OK/�
 想把占比数字对得更准，用 `--peak-tflops` 填你那张卡的 FP32 峰值：A100 80GB 19.5、A100 40GB 19.5、
 H100 SXM 66.9、V100 15.7。
 
+### PyTorch 版（cuBLAS，面板上的利用率更容易到 100%）
+
+`python/gpu_burn_torch.py` 不写 kernel，直接用 PyTorch 的 `matmul` 反复喂计算单元，原理和
+`python/gpu_burn_ascend.py` 一样：cuBLAS 是厂商调过的 GEMM，fp16/bf16 走 Tensor Core、fp32 走 FP32 管线，
+对平台的利用率面板来说就是"真实满载负载"：
+
+```bash
+python3 python/gpu_burn_torch.py --check
+python3 python/gpu_burn_torch.py --devices all --duration 1800 --stats 5
+python3 python/gpu_burn_torch.py --dtype fp32 --size 4096 --stats 1   # 想让 FP32 管线满
+```
+
+参数与 C 版对齐：`--devices`、`--mem-pct`、`--size`、`--dtype fp16|bf16|fp32`、`--queue`、`--duration`、
+`--stats`、`--check`、`--quiet`、`--version`；一个进程每张卡一个线程，`Ctrl-C` 时每张卡都释放显存。
+
+统计行报**实测 TFLOPS**，拿它和面板数字对照能区分两件事：如果实测已经接近峰值（A100 FP32 19.5 TFLOPS、
+fp16 Tensor Core 312 TFLOPS）而面板仍显示一半，那是面板的统计口径问题；如果实测也只有一半，说明卡被降频、
+撞功耗墙或者被分片了。代价是要装 PyTorch；镜像里没有 torch 时仍用 `./gpu_burn`（零依赖）。
+
 ### 退出码与信号
 
 | 退出码 | 含义 |
@@ -259,11 +295,27 @@ cd ascend && make                      # 生成 ./gpu_burn_ascend
 - 测试用假 `libascendcl.so`（`make -C ascend check`），没有 NPU 也能跑；真机的 ACL 原型 / 算子行为
   第一次请用 `--diag` 确认，细节见 [`ascend/README.md`](ascend/README.md)
 
+### Python 版（torch_npu）
+
+机器上已经装了 `torch` + `torch_npu` 的话，用 `python/gpu_burn_ascend.py` 更省事——不用编译，
+行为和 C 版对齐（`--devices all`、`--mem-pct`、`--duration`、`--stats`，一个进程每颗芯片一个线程，
+`Ctrl-C` 时各芯片都释放）：
+
+```bash
+python3 python/gpu_burn_ascend.py --check            # 自检一颗芯片
+python3 python/gpu_burn_ascend.py --devices all --duration 1800 --stats 5
+```
+
+算力靠反复 `torch.mm` 喂 AI Core（`--size` 默认 8192、`--dtype fp16`），统计行报实测 TFLOPS；
+和 C 版互相印证很方便：C 版报的 TFLOPS 与它接近，说明两边都没白跑。
+`--check` 用假 torch 也能在本机跑（`make check-py-ascend`，14 项断言），真机同样先跑 `--check`。
+
 ## 编译
 
 ```bash
-make            # 生成 ./gpu_burn
-make check      # 编译 + 跑端到端测试（不需要 GPU）
+make                # 生成 ./gpu_burn
+make check          # 编译 + 跑端到端测试（不需要 GPU）
+make check-py-cuda  # 用假 torch 跑 CUDA PyTorch 版的行为测试（不需要 GPU）
 make clean
 ```
 
@@ -280,13 +332,16 @@ CI 会分别在 ubuntu 20.04 / 22.04 / 24.04、debian 12 / 13 上编译并跑测
 
 ## 测试
 
-`make check` 用 `tests/` 下的假驱动（`mock_libcuda.c`、`mock_nvml.c`）替换真驱动，
+`make check` 用 `tests/cuda/` 下的假驱动（`mock_libcuda.c`、`mock_nvml.c`）替换真驱动，
 跑 36 项端到端用例：自检、`--diag`、常驻刷、`--duration`、OOM 降级、多 stream、`--churn`、
 `SIGTERM` 优雅退出、显存被别的进程占着、设备侧错误带码退出、分配/释放配平、上下文销毁，
 以及多卡相关的 `--devices 0,1` / `--devices all` / 越界卡号 / 只起一个进程 / 单卡失败隔离 /
 `SIGTERM` 后全部释放 / `kill -9` 后无残留进程。原生版和 Python 版各跑一遍。
 
-`tests/verify_ptx.sh` 校验两版生成的 PTX 是否逐字节一致；机器上有 `ptxas` 时
+`make -C ascend check` 是昇腾 C 版的 56 项假驱动用例；`make check-py-cuda` / `make check-py-ascend`
+用假 torch 分别跑 CUDA / 昇腾 Python 版的 14 项行为用例（自检、定时退出、多卡、越界卡号、SIGTERM 收尾、缺依赖退出码）。
+
+`tests/cuda/verify_ptx.sh` 校验两版生成的 PTX 是否逐字节一致；机器上有 `ptxas` 时
 （`PTXAS=/path/to/ptxas`）还会汇编一遍确认指令合法。
 
 ## 目录结构
@@ -294,24 +349,34 @@ CI 会分别在 ubuntu 20.04 / 22.04 / 24.04、debian 12 / 13 上编译并跑测
 ```
 .
 ├── Makefile
-├── src/gpu_burn.c          # 原生实现（单文件）
-├── python/gpu_burn.py      # Python 实现（单文件，仅标准库）
+├── src/gpu_burn.c             # CUDA 原生实现（单文件，内联 PTX）
+├── python/
+│   ├── gpu_burn.py            # CUDA Python 版（只用标准库）
+│   ├── gpu_burn_torch.py      # CUDA Python 版（PyTorch + cuBLAS）
+│   └── gpu_burn_ascend.py     # 昇腾 Python 版（torch_npu）
 ├── tests/
-│   ├── mock_libcuda.c      # 假 libcuda.so.1，模拟 Driver API
-│   ├── mock_nvml.c         # 假 libnvidia-ml.so.1
-│   ├── run_tests.sh        # 端到端用例（make check）
-│   └── verify_ptx.sh       # PTX 一致性 / ptxas 校验
-├── ascend/                 # 昇腾 NPU 版
-│   ├── gpu_burn_ascend.c   # 原生实现（单文件）
+│   ├── cuda/
+│   │   ├── mock_libcuda.c     # 假 libcuda.so.1，模拟 Driver API
+│   │   ├── mock_nvml.c        # 假 libnvidia-ml.so.1
+│   │   ├── run_tests.sh       # 端到端用例（make check）
+│   │   └── verify_ptx.sh      # PTX 一致性 / ptxas 校验
+│   └── python/
+│       ├── fake_torch/        # 假 torch（带 npu / cuda 两个后端）
+│       ├── test_cuda_py.sh    # CUDA PyTorch 版用例（make check-py-cuda）
+│       └── test_ascend_py.sh  # 昇腾 Python 版用例（make check-py-ascend）
+├── ascend/                    # 昇腾 NPU 版（C）
+│   ├── gpu_burn_ascend.c      # 原生实现（单文件，dlopen libascendcl.so）
+│   ├── Makefile
 │   ├── tests/
-│   │   ├── mock_libascendcl.c   # 假 libascendcl.so，模拟 CANN ACL
-│   │   └── run_tests.sh         # 端到端用例（make -C ascend check）
-│   └── README.md           # 昇腾版专门文档
+│   │   ├── mock_libascendcl.c # 假 libascendcl.so，模拟 CANN ACL
+│   │   └── run_tests.sh       # 端到端用例（make -C ascend check）
+│   └── README.md              # 昇腾版专门文档
 └── .github/
-    ├── workflows/ci.yml            # 测试 + 五个发行版构建 + 发 Release
-    ├── scripts/package.sh          # 打包成 dist/gpu-burn-*.tar.gz
-    ├── scripts/build-in-container.sh
-    └── RELEASE_NOTES.md            # Release 正文
+    ├── workflows/ci.yml              # 测试 + 五个发行版构建 + 发 Release
+    ├── scripts/package.sh            # CUDA 版打包
+    ├── scripts/package-ascend.sh     # 昇腾版打包（x86_64 / aarch64）
+    ├── scripts/build-in-container.sh # 在指定发行版容器里编译测试
+    └── RELEASE_NOTES.md              # Release 正文
 ```
 
 ## 典型表现

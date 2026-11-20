@@ -32,7 +32,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define VERSION "1.2.0"
+#define VERSION "1.3.0"
 
 #define KB (1u << 10)
 #define MB (1u << 20)

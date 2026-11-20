@@ -25,7 +25,7 @@ import time
 from ctypes import (POINTER, Structure, byref, c_char_p, c_float, c_int,
                     c_size_t, c_uint, c_uint32, c_uint64, c_void_p)
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 MAX_DEVICES = 32  # --devices all 最多展开这么多张，防手滑
 
 CUDA_SUCCESS = 0

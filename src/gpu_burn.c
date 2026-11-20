@@ -22,7 +22,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define VERSION "1.2.0"
+#define VERSION "1.3.0"
 
 /* ------------------------------------------------------------------------- */
 /* CUDA Driver API 的最小类型/常量定义（避免依赖 cuda.h）                      */

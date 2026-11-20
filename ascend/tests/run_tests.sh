@@ -281,7 +281,7 @@ hr
 echo "10) 其他参数"
 "$BIN" --version >"$OUT/t10a.log" 2>&1
 check_rc "10 --version 退出码" 0 $?
-check_grep "10 版本号" "$OUT/t10a.log" "gpu_burn_ascend 1.2.0"
+check_grep "10 版本号" "$OUT/t10a.log" "gpu_burn_ascend 1.3.0"
 
 "$BIN" --help >"$OUT/t10b.log" 2>&1
 check_rc "10 --help 退出码" 0 $?

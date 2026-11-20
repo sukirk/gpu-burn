@@ -4,11 +4,11 @@
 # mock 驱动只检查 PTX 里有没有该有的指令，真正决定 kernel 能不能跑的是驱动的 JIT；
 # 有 ptxas 就等于有一个离线 JIT 前端，可以提前发现语法错。
 #
-#   bash tests/verify_ptx.sh
-#   PTXAS=/path/to/ptxas bash tests/verify_ptx.sh
+#   bash tests/cuda/verify_ptx.sh
+#   PTXAS=/path/to/ptxas bash tests/cuda/verify_ptx.sh
 set -u
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 PY="${PY:-python3}"
 PYBIN="$ROOT/python/gpu_burn.py"
@@ -46,7 +46,7 @@ fi
 
 echo "== 真 ptxas 汇编 =="
 if [ -z "$PTXAS" ]; then
-    echo "  SKIP 没有 ptxas（可选：PTXAS=/path/to/ptxas bash tests/verify_ptx.sh）"
+    echo "  SKIP 没有 ptxas（可选：PTXAS=/path/to/ptxas bash tests/cuda/verify_ptx.sh）"
 else
     echo "  用: $PTXAS"
     # 三个变体：sm_80(ISA 7.0)、sm_80(ISA 8.0)、sm_70(ISA 6.4)

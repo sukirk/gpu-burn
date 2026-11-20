@@ -3,8 +3,9 @@ gpu_burn
 *.o
 
 # 测试产物
-tests/mock/*.so*
+tests/cuda/mock/*.so*
 tests/.out/
+tests/python/.out/
 tests/.mock.log
 
 # 打包产物（由 CI 传到 Release）

@@ -74,7 +74,7 @@ docker run --rm -it \
 | `--diag` | | 逐步骤（14 步）打印每步返回码，失败处停下并给出 `aclGetRecentErrMsg` |
 | `--npu-smi` | | 统计行里附上 `npu-smi info` 解析出的 AICore% / HBM 用量 / 温度 / 功耗 |
 | `--quiet` | | 只打错误 |
-| `--version` | | 打印 `gpu_burn_ascend 1.2.0`（和仓库同版本号） |
+| `--version` | | 打印 `gpu_burn_ascend 1.3.0`（和仓库同版本号） |
 | `-h`, `--help` | | 帮助 |
 
 HBM 分配方式：按 1 GiB 分块 `aclrtMalloc(ACL_MEM_MALLOC_HUGE_FIRST)`，每块立刻

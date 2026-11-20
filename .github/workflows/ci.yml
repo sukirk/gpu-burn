@@ -21,8 +21,10 @@ jobs:
         run: make
       - name: 端到端测试（假驱动，不需要 GPU）
         run: make check
+      - name: PyTorch 版行为测试（假 torch，不需要 GPU）
+        run: make check-py-cuda
       - name: PTX 一致性
-        run: bash tests/verify_ptx.sh
+        run: bash tests/cuda/verify_ptx.sh
 
   # 昇腾版：用假 libascendcl.so 跑端到端用例，CI 里不需要 NPU / CANN
   test-ascend:
@@ -34,6 +36,8 @@ jobs:
         run: make -C ascend
       - name: 端到端测试（假驱动，不需要 NPU）
         run: make -C ascend check
+      - name: Python 版行为测试（假 torch，不需要 NPU）
+        run: make check-py-ascend
 
   # 在老发行版容器里编并跑一遍测试：产物只要求 glibc 2.17，新版发行版上也能跑
   build-distro:

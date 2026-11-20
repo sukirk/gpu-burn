@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# 端到端测试：用 tests/mock/ 下的假 libcuda/libnvidia-ml 代替真驱动，
+# 端到端测试：用 tests/cuda/mock/ 下的假 libcuda/libnvidia-ml 代替真驱动，
 # 跑完整流程并检查退出码、关键日志、mock 侧看到的调用序列。不需要 GPU。
 #
 # 用法（在目标镜像或任意有 python3 + gcc 的环境里）：
-#   bash tests/run_tests.sh                 # 只测 python 版
-#   BIN=./gpu_burn bash tests/run_tests.sh  # 连原生版一起测（make check 就是这么跑的）
+#   bash tests/cuda/run_tests.sh            # 只测 python 版
+#   BIN=./gpu_burn bash tests/cuda/run_tests.sh  # 连原生版一起测（make check 就是这么跑的）
 set -u
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
-MOCK="$ROOT/tests/mock"
+MOCK="$ROOT/tests/cuda/mock"
 PYBIN="$ROOT/python/gpu_burn.py"
 PY="${PY:-python3}"
 BIN="${BIN:-}"
@@ -18,7 +18,7 @@ TMP="$ROOT/tests/.out"
 mkdir -p "$TMP"
 
 if [ ! -f "$MOCK/libcuda.so.1" ]; then
-    make -C "$ROOT" mocks >/dev/null || { echo "编不出 tests/mock 下的假驱动，需要 gcc"; exit 1; }
+    make -C "$ROOT" mocks >/dev/null || { echo "编不出 tests/cuda/mock 下的假驱动，需要 gcc"; exit 1; }
 fi
 
 pass=0
